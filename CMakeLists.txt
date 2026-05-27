@@ -5,9 +5,19 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")          # MSVC UTF-8 编码支持
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(WITH_GFLAGS OFF)
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -Xcompiler=/utf-8")
+
+
+if(MSVC)
+    # 为 C++ 目标设置 /utf-8
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
+
+    # 为 CUDA 目标设置 -Xcompiler=/utf-8
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+endif()
 
 
 # ==========================================
@@ -109,6 +119,9 @@ set(CMAKE_CUDA_ARCHITECTURES 89 120)
 include_directories(${Python3_INCLUDE_DIRS})
 include_directories(${pybind11_INCLUDE_DIRS})
 include_directories(${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+# 项目自身源码路径
+include_directories(${CMAKE_SOURCE_DIR}/csrc)          # ops/
+include_directories(${CMAKE_SOURCE_DIR}/csrc/ops)
 
 
 # ============================================
@@ -159,8 +172,42 @@ enable_testing()
 # 收集测试文件
 file(
         GLOB_RECURSE TEST_OPS CONFIGURE_DEPENDS
-        test/ops/*.cpp
-        test/ops/*.cu
+        tests/ops/*.cpp
+        tests/ops/*.cu
+)
+
+add_executable(
+        TEST_TENSOR
+        ${DIR_SOURCES}
+        tests/test_tensor.cu
+)
+target_include_directories(TEST_TENSOR PRIVATE
+        ${CMAKE_SOURCE_DIR}/nemotron_infer/csrc/include          # tensor.h, allocator.cuh
+)
+target_link_libraries(
+        TEST_TENSOR
+        Python3::Python        # 关键：链接 Python 库
+        pybind11::module       # 关键：链接 pybind11
+        CUDA::cudart
+        CUDA::cublas
+        glog::glog
+        GTest::gtest
+        GTest::gtest_main
+        GTest::gmock
+)
+add_custom_command(TARGET TEST_TENSOR POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:Python3::Python>        # 自动展开为 python312.dll 的完整路径
+        $<TARGET_FILE_DIR:TEST_TENSOR>          # TEST_OPS.exe 所在目录
+        COMMENT "Copying python312.dll next to TEST_OPS.exe"
+)
+set_target_properties(
+        TEST_TENSOR PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+)
+add_test(NAME TestTensor COMMAND TEST_TENSOR)
+set_tests_properties(TestTensor PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
 if (TEST_OPS)
@@ -170,7 +217,7 @@ if (TEST_OPS)
             ${TEST_OPS}
     )
     target_include_directories(TEST_OPS PRIVATE
-            ${libnpy_SOURCE_DIR}/include    # CPM 自动设置的这个变量
+            ${CMAKE_SOURCE_DIR}/nemotron_infer/csrc/include          # tensor.h, allocator.cuh
     )
     target_link_libraries(
             TEST_OPS
@@ -193,8 +240,8 @@ if (TEST_OPS)
             TEST_OPS PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
     )
-    add_test(NAME TestBase COMMAND TEST_OPS)
-    set_tests_properties(TestBase PROPERTIES
+    add_test(NAME TestOps COMMAND TEST_OPS)
+    set_tests_properties(TestOps PROPERTIES
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     )
 endif ()
