@@ -1,0 +1,6 @@
+#ifndef NEMOTRON_INFER_LIBRARY_CUH
+#define NEMOTRON_INFER_LIBRARY_CUH
+
+__global__ void hello();
+
+#endif //NEMOTRON_INFER_LIBRARY_CUH
