@@ -76,7 +76,7 @@ public:
 
         // 当前 slab 剩余不足 → 分配新 slab
         if (!current_slab_ || (current_slab_offset_ + aligned > current_slab_size_)) {
-            allocate_new_slab();
+            allocate_new_slab(aligned);
         }
 
         void* ptr = static_cast<char*>(current_slab_) + current_slab_offset_;
@@ -112,10 +112,10 @@ public:
     size_t num_slabs()       const { return slabs_.size(); }
 
 private:
-    void allocate_new_slab() {
-        // 分配大块 GPU 内存
+    void allocate_new_slab(size_t min_size = 0) {
+        // 分配大块 GPU 内存，至少满足 min_size
         void* slab = nullptr;
-        size_t alloc_size = std::max(slab_size_, ALIGNMENT);
+        size_t alloc_size = std::max({slab_size_, min_size, ALIGNMENT});
         cudaError_t err = cudaMalloc(&slab, alloc_size);
         if (err != cudaSuccess) {
             fprintf(stderr, "[FATAL] cudaMalloc for BumpAllocator slab failed: %s\n",
