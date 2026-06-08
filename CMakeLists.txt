@@ -9,6 +9,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /utf-8")          # MSVC UTF-8 编码支
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(WITH_GFLAGS OFF)
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -Xcompiler=/utf-8")
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake/Modules)
 
 
 if(MSVC)
@@ -114,7 +115,25 @@ set(CMAKE_CUDA_ARCHITECTURES 89 120)
 
 
 # ============================================
-# 4. 包含目录
+# 4. CUDNN
+# ============================================
+option(USE_CUDNN "Enable cuDNN library" OFF)
+
+if(USE_CUDNN)
+    include(FindCUDNN)   # 注意：这里是 include，不是 find_package
+
+    # 检查 cuDNN 是否被成功找到（脚本中如果没有设置 FOUND 变量，可以手动检查）
+    if(NOT DEFINED cuDNN_INCLUDE_DIR OR NOT DEFINED cuDNN_LIBRARY_DIR)
+        message(FATAL_ERROR "cuDNN not found. Please set CMAKE_INSTALL_PREFIX or CUDAToolkit_ROOT to the correct path.")
+    endif()
+
+    set(CUDNN_INCLUDE_DIRS ${cuDNN_INCLUDE_DIR})
+    set(CUDNN_LIBRARIES cudnn)   # 链接主要的共享库目标（Windows 下为 cudnn）
+endif()
+
+
+# ============================================
+# 5. 包含目录
 # ============================================
 include_directories(${Python3_INCLUDE_DIRS})
 include_directories(${pybind11_INCLUDE_DIRS})
@@ -125,7 +144,7 @@ include_directories(${CMAKE_SOURCE_DIR}/csrc/ops)
 
 
 # ============================================
-# 5. 源文件和库
+# 6. 源文件和库
 # ============================================
 pybind11_add_module(
         nemotron_infer SHARED
@@ -147,9 +166,16 @@ set_target_properties(
         VERSION 0.1.0
 )
 
+if (USE_CUDNN)
+    target_link_libraries(nemotron_infer PRIVATE ${CUDNN_LIBRARIES})
+    target_include_directories(nemotron_infer PRIVATE ${CUDNN_INCLUDE_DIRS})
+
+    target_compile_definitions(nemotron_infer PRIVATE USE_CUDNN)
+endif ()
+
 
 # ============================================
-# 6. 后处理 (仅cuda12的工具链, cuda13的目录应该略有不同)
+# 7. 后处理 (仅cuda12的工具链, cuda13的目录应该略有不同)
 # ============================================
 set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/nemotron_infer/csrc")
 file(GLOB CUDA_RUNTIME_DLL "${CUDAToolkit_BIN_DIR}/cudart64_*.dll")
@@ -195,6 +221,12 @@ target_link_libraries(
         GTest::gtest_main
         GTest::gmock
 )
+if (USE_CUDNN)
+    target_link_libraries(TEST_TENSOR ${CUDNN_LIBRARIES})
+    target_include_directories(TEST_TENSOR PRIVATE ${CUDNN_INCLUDE_DIRS})
+
+    target_compile_definitions(TEST_TENSOR PRIVATE USE_CUDNN)
+endif ()
 add_custom_command(TARGET TEST_TENSOR POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         $<TARGET_FILE:Python3::Python>        # 自动展开为 python312.dll 的完整路径
@@ -230,6 +262,12 @@ if (TEST_OPS)
             GTest::gtest_main
             GTest::gmock
     )
+    if (USE_CUDNN)
+        target_link_libraries(TEST_OPS ${CUDNN_LIBRARIES})
+        target_include_directories(TEST_OPS PRIVATE ${CUDNN_INCLUDE_DIRS})
+
+        target_compile_definitions(TEST_OPS PRIVATE USE_CUDNN)
+    endif ()
     add_custom_command(TARGET TEST_OPS POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:Python3::Python>        # 自动展开为 python312.dll 的完整路径
