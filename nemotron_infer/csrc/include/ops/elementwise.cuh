@@ -10,6 +10,7 @@
 
 #ifdef USE_CUDNN
 #include <cudnn.h>
+#include "cudnn_ctx.h"
 #endif
 
 
@@ -270,9 +271,6 @@ namespace nemotron::ops {
                 out_z = __hmul2(out_z, out_z);
                 out_w = __hmul2(out_w, out_w);
             } else if constexpr (Op == kElementwiseSilu) {
-#ifdef USE_CUDNN
-
-#else
                 auto in0_f_val_x = __bfloat1622float2(in0_bf_val_x);
                 auto in0_f_val_y = __bfloat1622float2(in0_bf_val_y);
                 auto in0_f_val_z = __bfloat1622float2(in0_bf_val_z);
@@ -291,7 +289,6 @@ namespace nemotron::ops {
                 out_y = __float22bfloat162_rn(in0_f_val_y);
                 out_z = __float22bfloat162_rn(in0_f_val_z);
                 out_w = __float22bfloat162_rn(in0_f_val_w);
-#endif
             } else if constexpr (Op == kElementwiseClampSoftplus) {
                 const float4 bias_val = bias_vec[tid];
 
@@ -386,6 +383,33 @@ namespace nemotron::ops {
         const float clamp_max = 1.f,
         cudaStream_t stream = nullptr
     ) {
+#ifdef USE_CUDNN
+        if constexpr (ops_type == kElementwiseSilu) {
+            const auto& ctx = nemotron::CudnnContext::instance();
+            cudnnSetStream(ctx.handle(), stream);
+            cudnnSetTensor4dDescriptor(
+                ctx.tensor_desc(), CUDNN_TENSOR_NCHW,
+                CUDNN_DATA_BFLOAT16, 1, 1, 1, size
+            );
+
+            cudnnActivationDescriptor_t act_desc{};
+            cudnnCreateActivationDescriptor(&act_desc);
+            cudnnSetActivationDescriptor(
+                act_desc, CUDNN_ACTIVATION_SWISH,
+                CUDNN_PROPAGATE_NAN, 1.0f
+            );
+
+            float alpha = 1.f, beta = 0.f;
+            cudnnActivationForward(
+                ctx.handle(), act_desc,
+                &alpha, ctx.tensor_desc(), in0,
+                &beta,  ctx.tensor_desc(), out0
+            );
+            cudnnDestroyActivationDescriptor(act_desc);
+            return;
+        }
+#endif
+
         constexpr size_t block_dimx = 1024;
         const size_t grid_dimx = (size + block_dimx - 1) / block_dimx;
 
