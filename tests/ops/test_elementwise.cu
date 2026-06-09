@@ -526,7 +526,10 @@ TEST_F(ElementwiseCorrectnessTestBF16, ClampSoftplus) {
 
 class ElementwisePerfTest : public ::testing::Test {
 protected:
-    void SetUp() override { warmup_gpu(); }
+    void SetUp() override {
+        default_allocator().reset();
+        warmup_gpu();
+    }
 
     static constexpr size_t PERF_N = 32ULL * 1024 * 1024;  // 32M elements = 128 MB
     static constexpr size_t BYTES  = PERF_N * sizeof(float);
@@ -626,7 +629,10 @@ TEST_F(ElementwisePerfTest, ClampSoftplus_Bandwidth) {
 
 class ElementwisePerfTestBF16 : public ::testing::Test {
 protected:
-    void SetUp() override { warmup_gpu(); }
+    void SetUp() override {
+        default_allocator().reset();
+        warmup_gpu();
+    }
 
     static constexpr size_t PERF_N = 32ULL * 1024 * 1024;
     static constexpr size_t BYTES  = PERF_N * sizeof(bfloat16_t);
@@ -726,6 +732,7 @@ TEST_F(ElementwisePerfTestBF16, ClampSoftplus_Bandwidth) {
 class ElementwiseComparisonTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        default_allocator().reset();
         warmup_gpu();
         // 分配 FP32 buffer
         if (!fp32_in0.data_) {

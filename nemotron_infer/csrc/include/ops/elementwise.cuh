@@ -383,9 +383,9 @@ namespace nemotron::ops {
         const float clamp_max = 1.f,
         cudaStream_t stream = nullptr
     ) {
-#ifdef USE_CUDNN
+        #ifdef USE_CUDNN
         if constexpr (ops_type == kElementwiseSilu) {
-            const auto& ctx = nemotron::CudnnContext::instance();
+            const auto& ctx = CudnnContext::instance();
             cudnnSetStream(ctx.handle(), stream);
             cudnnSetTensor4dDescriptor(
                 ctx.tensor_desc(), CUDNN_TENSOR_NCHW,
@@ -408,7 +408,7 @@ namespace nemotron::ops {
             cudnnDestroyActivationDescriptor(act_desc);
             return;
         }
-#endif
+        #endif
 
         constexpr size_t block_dimx = 1024;
         const size_t grid_dimx = (size + block_dimx - 1) / block_dimx;
