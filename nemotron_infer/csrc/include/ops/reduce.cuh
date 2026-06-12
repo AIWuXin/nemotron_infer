@@ -244,14 +244,52 @@ namespace nemotron::ops {
 
 
     /**
-     * 分组block规约
-     **/
+     * 分组 block 规约 — 一趟 __syncthreads 完成 Group 组归约
+     * 结构与 block_reduce_sum 严格一致，仅把 float 换为 float[Group]
+     */
     template<int Group>
     __device__ __forceinline__ void block_group_reduce_sum(float* vals) {
+        const uint32_t lane = threadIdx.x & WARP_BIT;
+        const uint32_t wid  = threadIdx.x >> WARP_BIT_SIZE;
+        const uint32_t num_warps = blockDim.x >> WARP_BIT_SIZE;
+
+        // Step 1: 各 warp 内 Group 组独立做 butterfly reduction
         #pragma unroll
-        for (int group_idx = 0; group_idx < Group; ++group_idx) {
-            vals[group_idx] = block_reduce_sum(vals[group_idx]);
+        for (int g = 0; g < Group; ++g)
+            vals[g] = warp_reduce_sum(vals[g]);
+
+        // Step 2: 每个 warp 的 lane 0 写 partial sum 到 shared
+        //         布局: s[wid][g] — 第一维是 warp idx，跟 block_reduce_sum 对齐
+        __shared__ float s[32][Group];
+        if (lane == 0) {
+            #pragma unroll
+            for (int g = 0; g < Group; ++g)
+                s[wid][g] = vals[g];
         }
+        __syncthreads();
+
+        // Step 3: 所有线程 gather（对照 block_reduce_sum 的
+        //         val = threadIdx.x < max_wid ? shared[threadIdx.x] : 0.f）
+        //         这里把 Group 个值一起装进 group 维度
+        #pragma unroll
+        for (int g = 0; g < Group; ++g)
+            vals[g] = (threadIdx.x < num_warps) ? s[threadIdx.x][g] : 0.f;
+
+        // Step 4: 只有 warp 0 做最终归约并写回（跟 block_reduce_sum 完全一致）
+        if (wid == 0) {
+            #pragma unroll
+            for (int g = 0; g < Group; ++g)
+                vals[g] = warp_reduce_sum(vals[g]);
+            #pragma unroll
+            for (int g = 0; g < Group; ++g)
+                s[0][g] = vals[g];
+        }
+        __syncthreads();
+
+        // Step 5: 所有线程读取最终结果（跟 block_reduce_sum return shared_sum[0] 一致）
+        #pragma unroll
+        for (int g = 0; g < Group; ++g)
+            vals[g] = s[0][g];
     }
 
     template<int Group>

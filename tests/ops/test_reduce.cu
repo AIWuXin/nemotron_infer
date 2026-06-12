@@ -18,70 +18,72 @@ using namespace nemotron::ops;
 // 1. CPU 参考实现
 // ===========================================================================
 namespace ref {
-
-void rmsnorm_fp32(const float* x, float* y, const float* w, size_t n, float eps) {
-    float sum_sq = 0.f;
-    for (size_t i = 0; i < n; ++i) sum_sq += x[i] * x[i];
-    float scale = 1.f / std::sqrt(sum_sq / n + eps);
-    for (size_t i = 0; i < n; ++i) y[i] = x[i] * scale * w[i];
-}
-
-void rmsnorm_bf16(const float* x, float* y, const float* w, size_t n, float eps) {
-    // 模拟 bf16 量化: float → bf16 → float
-    std::vector<float> x_bf16(n);
-    for (size_t i = 0; i < n; ++i) {
-        x_bf16[i] = __bfloat162float(__float2bfloat16_rn(x[i]));
-    }
-    float sum_sq = 0.f;
-    for (size_t i = 0; i < n; ++i) sum_sq += x_bf16[i] * x_bf16[i];
-    float scale = 1.f / std::sqrt(sum_sq / n + eps);
-    for (size_t i = 0; i < n; ++i) {
-        float val = x_bf16[i] * scale * __bfloat162float(__float2bfloat16_rn(w[i]));
-        y[i] = __bfloat162float(__float2bfloat16_rn(val));
-    }
-}
-
-void rmsnorm_gated_fp32(const float* x, float* y, const float* w, const float* gate,
-                         size_t cols, size_t group_size, float eps) {
-    size_t groups = cols / group_size;
-    for (size_t g = 0; g < groups; ++g) {
+    void rmsnorm_fp32(const float *x, float *y, const float *w, size_t n, float eps) {
         float sum_sq = 0.f;
-        for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-            sum_sq += x[i] * x[i];
-        float scale = 1.f / std::sqrt(sum_sq / group_size + eps);
-        for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-            y[i] = x[i] * scale * w[i] * gate[i];
+        for (size_t i = 0; i < n; ++i) sum_sq += x[i] * x[i];
+        float scale = 1.f / std::sqrt(sum_sq / n + eps);
+        for (size_t i = 0; i < n; ++i) y[i] = x[i] * scale * w[i];
     }
-}
 
-void rmsnorm_gated_bf16(const float* x, float* y, const float* w, const float* gate,
-                         size_t cols, size_t group_size, float eps) {
-    std::vector<float> x_bf16(cols), gate_bf16(cols);
-    for (size_t i = 0; i < cols; ++i) {
-        x_bf16[i] = __bfloat162float(__float2bfloat16_rn(x[i]));
-        gate_bf16[i] = __bfloat162float(__float2bfloat16_rn(gate[i]));
-    }
-    size_t groups = cols / group_size;
-    for (size_t g = 0; g < groups; ++g) {
+    void rmsnorm_bf16(const float *x, float *y, const float *w, size_t n, float eps) {
+        // 模拟 bf16 量化: float → bf16 → float
+        std::vector<float> x_bf16(n);
+        for (size_t i = 0; i < n; ++i) {
+            x_bf16[i] = __bfloat162float(__float2bfloat16_rn(x[i]));
+        }
         float sum_sq = 0.f;
-        for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-            sum_sq += x_bf16[i] * x_bf16[i];
-        float scale = 1.f / std::sqrt(sum_sq / group_size + eps);
-        for (size_t i = g * group_size; i < (g + 1) * group_size; ++i) {
-            float v = x_bf16[i] * scale * __bfloat162float(__float2bfloat16_rn(w[i])) * gate_bf16[i];
-            y[i] = __bfloat162float(__float2bfloat16_rn(v));
+        for (size_t i = 0; i < n; ++i) sum_sq += x_bf16[i] * x_bf16[i];
+        float scale = 1.f / std::sqrt(sum_sq / n + eps);
+        for (size_t i = 0; i < n; ++i) {
+            float val = x_bf16[i] * scale * __bfloat162float(__float2bfloat16_rn(w[i]));
+            y[i] = __bfloat162float(__float2bfloat16_rn(val));
         }
     }
-}
 
-}  // namespace ref
+    void rmsnorm_gated_fp32(
+        const float *x, float *y, const float *w, const float *gate,
+        size_t cols, size_t group_size, float eps
+    ) {
+        size_t groups = cols / group_size;
+        for (size_t g = 0; g < groups; ++g) {
+            float sum_sq = 0.f;
+            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
+                sum_sq += x[i] * x[i];
+            float scale = 1.f / std::sqrt(sum_sq / group_size + eps);
+            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
+                y[i] = x[i] * scale * w[i] * gate[i];
+        }
+    }
+
+    void rmsnorm_gated_bf16(
+        const float *x, float *y, const float *w, const float *gate,
+        size_t cols, size_t group_size, float eps
+    ) {
+        std::vector<float> x_bf16(cols), gate_bf16(cols);
+        for (size_t i = 0; i < cols; ++i) {
+            x_bf16[i] = __bfloat162float(__float2bfloat16_rn(x[i]));
+            gate_bf16[i] = __bfloat162float(__float2bfloat16_rn(gate[i]));
+        }
+        size_t groups = cols / group_size;
+        for (size_t g = 0; g < groups; ++g) {
+            float sum_sq = 0.f;
+            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
+                sum_sq += x_bf16[i] * x_bf16[i];
+            float scale = 1.f / std::sqrt(sum_sq / group_size + eps);
+            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i) {
+                float v = x_bf16[i] * scale * __bfloat162float(__float2bfloat16_rn(w[i])) * gate_bf16[i];
+                y[i] = __bfloat162float(__float2bfloat16_rn(v));
+            }
+        }
+    }
+} // namespace ref
 
 // ===========================================================================
 // 2. 辅助函数
 // ===========================================================================
 
 static void warmup_gpu() {
-    float* buf = nullptr;
+    float *buf = nullptr;
     cudaMalloc(&buf, 1024);
     cudaMemset(buf, 0, 1024);
     cudaDeviceSynchronize();
@@ -102,7 +104,7 @@ static std::vector<float> rand_vec(size_t n, float range = 1.f) {
 class RMSNormCorrectnessTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        default_allocator().reset();  // 清理前面测试套件累积的显存
+        default_allocator().reset(); // 清理前面测试套件累积的显存
         warmup_gpu();
     }
 };
@@ -115,8 +117,10 @@ TEST_F(RMSNormCorrectnessTest, FP32_Small) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_fp32(x.data() + r * cols, expected.data() + r * cols,
-                          w.data(), cols, 1e-5f);
+        ref::rmsnorm_fp32(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), cols, 1e-5f
+        );
 
     auto d_x = allocate_tensor<float>(TensorShape::make_1d(rows * cols));
     auto d_y = allocate_tensor_zeros<float>(TensorShape::make_1d(rows * cols));
@@ -134,7 +138,9 @@ TEST_F(RMSNormCorrectnessTest, FP32_Small) {
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
 }
 
 TEST_F(RMSNormCorrectnessTest, FP32_FullHidden) {
@@ -146,8 +152,10 @@ TEST_F(RMSNormCorrectnessTest, FP32_FullHidden) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_fp32(x.data() + r * cols, expected.data() + r * cols,
-                          w.data(), cols, 1e-5f);
+        ref::rmsnorm_fp32(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), cols, 1e-5f
+        );
 
     auto d_x = allocate_tensor<float>(TensorShape::make_1d(rows * cols));
     auto d_y = allocate_tensor_zeros<float>(TensorShape::make_1d(rows * cols));
@@ -165,7 +173,9 @@ TEST_F(RMSNormCorrectnessTest, FP32_FullHidden) {
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
 }
 
 TEST_F(RMSNormCorrectnessTest, FP32_GridStride) {
@@ -178,8 +188,10 @@ TEST_F(RMSNormCorrectnessTest, FP32_GridStride) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_fp32(x.data() + r * cols, expected.data() + r * cols,
-                          w.data(), cols, 1e-5f);
+        ref::rmsnorm_fp32(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), cols, 1e-5f
+        );
 
     auto d_x = allocate_tensor<float>(TensorShape::make_1d(rows * cols));
     auto d_y = allocate_tensor_zeros<float>(TensorShape::make_1d(rows * cols));
@@ -198,7 +210,9 @@ TEST_F(RMSNormCorrectnessTest, FP32_GridStride) {
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
 }
 
 TEST_F(RMSNormCorrectnessTest, FP32_SingleRow) {
@@ -226,7 +240,9 @@ TEST_F(RMSNormCorrectnessTest, FP32_SingleRow) {
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
 }
 
 // ===========================================================================
@@ -249,8 +265,10 @@ TEST_F(RMSNormCorrectnessTestBF16, Small) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_bf16(x.data() + r * cols, expected.data() + r * cols,
-                          w.data(), cols, 1e-5f);
+        ref::rmsnorm_bf16(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), cols, 1e-5f
+        );
 
     std::vector<bfloat16_t> x_bf16(rows * cols);
     for (size_t i = 0; i < rows * cols; ++i)
@@ -275,7 +293,9 @@ TEST_F(RMSNormCorrectnessTestBF16, Small) {
         EXPECT_NEAR(out[i], expected[i], 0.5f) << " at index " << i;
     }
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
 }
 
 TEST_F(RMSNormCorrectnessTestBF16, FullHidden) {
@@ -286,8 +306,10 @@ TEST_F(RMSNormCorrectnessTestBF16, FullHidden) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_bf16(x.data() + r * cols, expected.data() + r * cols,
-                          w.data(), cols, 1e-5f);
+        ref::rmsnorm_bf16(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), cols, 1e-5f
+        );
 
     std::vector<bfloat16_t> x_bf16(rows * cols);
     for (size_t i = 0; i < rows * cols; ++i)
@@ -312,7 +334,9 @@ TEST_F(RMSNormCorrectnessTestBF16, FullHidden) {
         EXPECT_NEAR(out[i], expected[i], 0.5f) << " at index " << i;
     }
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
 }
 
 // ===========================================================================
@@ -363,8 +387,10 @@ TEST_F(RMSNormPerfTest, FP32_Bandwidth) {
 
     size_t bytes = ROWS * COLS * sizeof(float);
     double bw = (bytes * 2.0) / (ms * 1e6);
-    printf("  [Perf] RMSNorm FP32:   %6.3f ms | %7.2f GB/s | %zu rows x %zu cols\n",
-           ms, bw, (size_t)ROWS, (size_t)COLS);
+    printf(
+        "  [Perf] RMSNorm FP32:   %6.3f ms | %7.2f GB/s | %zu rows x %zu cols\n",
+        ms, bw, (size_t) ROWS, (size_t) COLS
+    );
     EXPECT_GT(bw, 50.0);
 }
 
@@ -421,8 +447,10 @@ TEST_F(RMSNormPerfTestBF16, Bandwidth) {
 
     size_t bytes = ROWS * COLS * sizeof(bfloat16_t);
     double bw = (bytes * 2.0) / (ms * 1e6);
-    printf("  [Perf] RMSNorm BF16:   %6.3f ms | %7.2f GB/s | %zu rows x %zu cols\n",
-           ms, bw, (size_t)ROWS, (size_t)COLS);
+    printf(
+        "  [Perf] RMSNorm BF16:   %6.3f ms | %7.2f GB/s | %zu rows x %zu cols\n",
+        ms, bw, (size_t) ROWS, (size_t) COLS
+    );
     EXPECT_GT(bw, 50.0);
 }
 
@@ -448,8 +476,10 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_Small) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_gated_fp32(x.data() + r * cols, expected.data() + r * cols,
-                                w.data(), gate.data() + r * cols, cols, group_size, 1e-5f);
+        ref::rmsnorm_gated_fp32(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), gate.data() + r * cols, cols, group_size, 1e-5f
+        );
 
     auto d_x = allocate_tensor<float>(TensorShape::make_1d(rows * cols));
     auto d_y = allocate_tensor_zeros<float>(TensorShape::make_1d(rows * cols));
@@ -460,8 +490,10 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_Small) {
     copy_host_to_device(d_gate, gate.data());
     cudaDeviceSynchronize();
 
-    rmsnorm_gated_fp32<4>(d_x.data_, d_y.data_, d_w.data_, d_gate.data_,
-                          rows, cols, group_size, 1e-5f);
+    rmsnorm_gated_fp32<4>(
+        d_x.data_, d_y.data_, d_w.data_, d_gate.data_,
+        rows, cols, group_size, 1e-5f
+    );
     cudaDeviceSynchronize();
 
     copy_device_to_host(out.data(), d_y);
@@ -470,7 +502,10 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_Small) {
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w); free_tensor(d_gate);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
+    free_tensor(d_gate);
 }
 
 TEST_F(RMSNormGatedCorrectnessTest, FP32_FullMamba) {
@@ -483,16 +518,20 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_FullMamba) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_gated_fp32(x.data() + r * cols, expected.data() + r * cols,
-                                w.data(), gate.data() + r * cols, cols, group_size, 1e-5f);
+        ref::rmsnorm_gated_fp32(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), gate.data() + r * cols, cols, group_size, 1e-5f
+        );
 
     // --- 调试：打印行 0 各组 sq_sum ---
     for (int g = 0; g < 8; g++) {
         float sum_sq = 0.f;
         for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
             sum_sq += x[i] * x[i];
-        printf("  [Ref]  Group %d: sum_sq=%.2f scale=%.4f\n", g, sum_sq,
-               1.f / std::sqrt(sum_sq / group_size + 1e-5f));
+        printf(
+            "  [Ref]  Group %d: sum_sq=%.2f scale=%.4f\n", g, sum_sq,
+            1.f / std::sqrt(sum_sq / group_size + 1e-5f)
+        );
     }
 
     auto d_x = allocate_tensor<float>(TensorShape::make_1d(rows * cols));
@@ -504,27 +543,40 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_FullMamba) {
     copy_host_to_device(d_gate, gate.data());
     cudaDeviceSynchronize();
 
-    rmsnorm_gated_fp32<8>(d_x.data_, d_y.data_, d_w.data_, d_gate.data_,
-                          rows, cols, group_size, 1e-5f);
+    rmsnorm_gated_fp32<8>(
+        d_x.data_, d_y.data_, d_w.data_, d_gate.data_,
+        rows, cols, group_size, 1e-5f
+    );
     cudaDeviceSynchronize();
 
     copy_device_to_host(out.data(), d_y);
     cudaDeviceSynchronize();
 
     // --- 调试：打印 GPU 行 0 第一个元素，对比参考 ---
-    printf("  [GPU]  Row 0 col 0: out=%.6f expected=%.6f ratio=%.4f\n",
-           out[0], expected[0], out[0] / expected[0]);
-    printf("  [GPU]  Row 0 col 960 (group 1): out=%.6f expected=%.6f ratio=%.4f\n",
-           out[960], expected[960], out[960] / expected[960]);
-    printf("  [GPU]  Row 0 col 1920 (group 2): out=%.6f expected=%.6f ratio=%.4f\n",
-           out[1920], expected[1920], out[1920] / expected[1920]);
-    printf("  [GPU]  Row 0 col 6720 (group 7): out=%.6f expected=%.6f ratio=%.4f\n",
-           out[6720], expected[6720], out[6720] / expected[6720]);
+    printf(
+        "  [GPU]  Row 0 col 0: out=%.6f expected=%.6f ratio=%.4f\n",
+        out[0], expected[0], out[0] / expected[0]
+    );
+    printf(
+        "  [GPU]  Row 0 col 960 (group 1): out=%.6f expected=%.6f ratio=%.4f\n",
+        out[960], expected[960], out[960] / expected[960]
+    );
+    printf(
+        "  [GPU]  Row 0 col 1920 (group 2): out=%.6f expected=%.6f ratio=%.4f\n",
+        out[1920], expected[1920], out[1920] / expected[1920]
+    );
+    printf(
+        "  [GPU]  Row 0 col 6720 (group 7): out=%.6f expected=%.6f ratio=%.4f\n",
+        out[6720], expected[6720], out[6720] / expected[6720]
+    );
 
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w); free_tensor(d_gate);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
+    free_tensor(d_gate);
 }
 
 TEST_F(RMSNormGatedCorrectnessTest, BF16_FullMamba) {
@@ -536,8 +588,10 @@ TEST_F(RMSNormGatedCorrectnessTest, BF16_FullMamba) {
     std::vector<float> expected(rows * cols), out(rows * cols);
 
     for (size_t r = 0; r < rows; ++r)
-        ref::rmsnorm_gated_bf16(x.data() + r * cols, expected.data() + r * cols,
-                                w.data(), gate.data() + r * cols, cols, group_size, 1e-5f);
+        ref::rmsnorm_gated_bf16(
+            x.data() + r * cols, expected.data() + r * cols,
+            w.data(), gate.data() + r * cols, cols, group_size, 1e-5f
+        );
 
     std::vector<bfloat16_t> x_bf16(rows * cols), gate_bf16(rows * cols);
     for (size_t i = 0; i < rows * cols; ++i) {
@@ -554,8 +608,10 @@ TEST_F(RMSNormGatedCorrectnessTest, BF16_FullMamba) {
     copy_host_to_device(d_gate, gate_bf16.data());
     cudaDeviceSynchronize();
 
-    rmsnorm_gated_bf16<8>(d_x.data_, d_y.data_, d_w.data_, d_gate.data_,
-                          rows, cols, group_size, 1e-5f);
+    rmsnorm_gated_bf16<8>(
+        d_x.data_, d_y.data_, d_w.data_, d_gate.data_,
+        rows, cols, group_size, 1e-5f
+    );
     cudaDeviceSynchronize();
 
     std::vector<bfloat16_t> out_bf16(rows * cols);
@@ -567,7 +623,10 @@ TEST_F(RMSNormGatedCorrectnessTest, BF16_FullMamba) {
         EXPECT_NEAR(out[i], expected[i], 0.5f) << " at index " << i;
     }
 
-    free_tensor(d_x); free_tensor(d_y); free_tensor(d_w); free_tensor(d_gate);
+    free_tensor(d_x);
+    free_tensor(d_y);
+    free_tensor(d_w);
+    free_tensor(d_gate);
 }
 
 // ===========================================================================
@@ -623,38 +682,48 @@ TEST_F(RMSNormGatedComparisonTest, Speedup) {
 
     // FP32
     for (int i = 0; i < warmup_iters; ++i)
-        rmsnorm_gated_fp32<8>(fp32_x.data_, fp32_y.data_, fp32_w.data_, fp32_gate.data_,
-                              ROWS, COLS, GROUP_SIZE, 1e-5f);
+        rmsnorm_gated_fp32<8>(
+            fp32_x.data_, fp32_y.data_, fp32_w.data_, fp32_gate.data_,
+            ROWS, COLS, GROUP_SIZE, 1e-5f
+        );
     cudaDeviceSynchronize();
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < bench_iters; ++i)
-        rmsnorm_gated_fp32<8>(fp32_x.data_, fp32_y.data_, fp32_w.data_, fp32_gate.data_,
-                              ROWS, COLS, GROUP_SIZE, 1e-5f);
+        rmsnorm_gated_fp32<8>(
+            fp32_x.data_, fp32_y.data_, fp32_w.data_, fp32_gate.data_,
+            ROWS, COLS, GROUP_SIZE, 1e-5f
+        );
     cudaDeviceSynchronize();
     auto t1 = std::chrono::high_resolution_clock::now();
     double fp32_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / bench_iters;
 
     // BF16
     for (int i = 0; i < warmup_iters; ++i)
-        rmsnorm_gated_bf16<8>(bf16_x.data_, bf16_y.data_, bf16_w.data_, bf16_gate.data_,
-                              ROWS, COLS, GROUP_SIZE, 1e-5f);
+        rmsnorm_gated_bf16<8>(
+            bf16_x.data_, bf16_y.data_, bf16_w.data_, bf16_gate.data_,
+            ROWS, COLS, GROUP_SIZE, 1e-5f
+        );
     cudaDeviceSynchronize();
     t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < bench_iters; ++i)
-        rmsnorm_gated_bf16<8>(bf16_x.data_, bf16_y.data_, bf16_w.data_, bf16_gate.data_,
-                              ROWS, COLS, GROUP_SIZE, 1e-5f);
+        rmsnorm_gated_bf16<8>(
+            bf16_x.data_, bf16_y.data_, bf16_w.data_, bf16_gate.data_,
+            ROWS, COLS, GROUP_SIZE, 1e-5f
+        );
     cudaDeviceSynchronize();
     t1 = std::chrono::high_resolution_clock::now();
     double bf16_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / bench_iters;
 
     double speedup = fp32_ms / bf16_ms;
-    size_t bytes_per_elem = 4;  // read x + gate + write y = 3 × sizeof = 12 for FP32, 6 for BF16
+    size_t bytes_per_elem = 4; // read x + gate + write y = 3 × sizeof = 12 for FP32, 6 for BF16
     size_t fp32_bytes = ROWS * COLS * bytes_per_elem * 3;
     size_t bf16_bytes = ROWS * COLS * (bytes_per_elem / 2) * 3;
     double fp32_bw = fp32_bytes / (fp32_ms * 1e6);
     double bf16_bw = bf16_bytes / (bf16_ms * 1e6);
 
-    printf("  [Compare] RMSNorm Gated       FP32: %6.3f ms (%5.1f GB/s) | BF16: %6.3f ms (%5.1f GB/s) | Speedup: %.2f x\n",
-           fp32_ms, fp32_bw, bf16_ms, bf16_bw, speedup);
+    printf(
+        "  [Compare] RMSNorm Gated       FP32: %6.3f ms (%5.1f GB/s) | BF16: %6.3f ms (%5.1f GB/s) | Speedup: %.2f x\n",
+        fp32_ms, fp32_bw, bf16_ms, bf16_bw, speedup
+    );
     EXPECT_GT(speedup, 0.5);
 }
