@@ -248,37 +248,10 @@ namespace nemotron::ops {
      **/
     template<int Group>
     __device__ __forceinline__ void block_group_reduce_sum(float* vals) {
-        const uint32_t lane_idx = threadIdx.x & WARP_BIT;
-        const uint32_t wid_idx = threadIdx.x >> WARP_BIT_SIZE;
-        const uint32_t max_wid = blockDim.x >> WARP_BIT_SIZE;
-
         #pragma unroll
         for (int group_idx = 0; group_idx < Group; ++group_idx) {
-            vals[group_idx] = warp_reduce_sum(vals[group_idx]);
+            vals[group_idx] = block_reduce_sum(vals[group_idx]);
         }
-
-        __shared__ float shared[Group][32];
-        if (lane_idx == 0) {
-            #pragma unroll
-            for (int group_idx = 0; group_idx < Group; ++group_idx) {
-                shared[group_idx][wid_idx] = vals[group_idx];
-            }
-        }
-        __syncthreads();
-
-        if (wid_idx == 0) {
-            #pragma unroll
-            for (int group_idx = 0; group_idx < Group; ++group_idx) {
-                vals[group_idx] = threadIdx.x < max_wid ? shared[group_idx][lane_idx] : 0.f;
-                vals[group_idx] = warp_reduce_sum(vals[group_idx]);
-            }
-        }
-        __syncthreads();
-
-        if (threadIdx.x < Group) shared[threadIdx.x][0] = vals[threadIdx.x];
-        __syncthreads();
-        #pragma unroll
-        for (int group_idx = 0; group_idx < Group; ++group_idx) vals[group_idx] = shared[group_idx][0];
     }
 
     template<int Group>
@@ -287,12 +260,217 @@ namespace nemotron::ops {
         float* __restrict__ y,
         const float* __restrict__ w,
         const float* __restrict__ gate,
-        const float* __restrict__ 
         const size_t rows,
         const size_t cols,
+        const size_t group_size,
         const float eps = 1e-5f
     ) {
+        for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+            const float* x_row = x + row * cols;
+            const float* g_row = gate + row * cols;
+            float* y_row = y + row * cols;
 
+            // Step 1: Group 组各自求 sq_sum
+            float sq_sum[Group] = {0.f};
+            for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
+                float val = x_row[col];
+                sq_sum[col / group_size] += val * val;
+            }
+
+            // Step 2: block 级组规约
+            block_group_reduce_sum<Group>(sq_sum);
+
+            // Step 3: 每组算 scale
+            float scale[Group];
+            #pragma unroll
+            for (int g = 0; g < Group; ++g)
+                scale[g] = rsqrtf(sq_sum[g] / static_cast<float>(group_size) + eps);
+
+            // Step 4: 写输出: y = x * rms * w * gate
+            for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
+                float val = x_row[col];
+                y_row[col] = val * scale[col / group_size] * w[col] * g_row[col];
+            }
+
+            __syncthreads();
+        }
+    }
+
+    template<int Group>
+    __global__ void rmsnorm_gated_launch_fp32(
+        const float* __restrict__ x,
+        float* __restrict__ y,
+        const float* __restrict__ w,
+        const float* __restrict__ gate,
+        const size_t rows,
+        const size_t cols,
+        const size_t group_size,
+        const float eps
+    ) {
+        rmsnorm_gated_kernel_fp32<Group>(x, y, w, gate, rows, cols, group_size, eps);
+    }
+
+    template<int Group>
+    inline __host__ void rmsnorm_gated_fp32(
+        const float* in0,
+        float* out0,
+        const float* weight,
+        const float* gate,
+        const size_t rows,
+        const size_t cols,
+        const size_t group_size,
+        const float eps = 1e-5f,
+        cudaStream_t stream = nullptr
+    ) {
+        constexpr int block_dimx = 256;
+        const int grid_dimx = min(rows, static_cast<size_t>(8192));
+        rmsnorm_gated_launch_fp32<Group><<<grid_dimx, block_dimx, 0, stream>>>(
+            in0, out0, weight, gate, rows, cols, group_size, eps
+        );
+    }
+
+
+    // ===========================================================================
+    // BF16 门控 RMSNorm（向量化）
+    // ===========================================================================
+    template<int Group>
+    __device__ __forceinline__ void rmsnorm_gated_kernel_bf16(
+        const __nv_bfloat16* __restrict__ x,
+        __nv_bfloat16* __restrict__ y,
+        const float* __restrict__ w,
+        const __nv_bfloat16* __restrict__ gate,
+        const size_t rows,
+        const size_t cols,
+        const size_t group_size,
+        const float eps = 1e-5f
+    ) {
+        const size_t vec_size = cols / 8;
+        const auto x_vec = reinterpret_cast<const float4*>(x);
+        const auto g_vec = reinterpret_cast<const float4*>(gate);
+        auto y_vec = reinterpret_cast<float4*>(y);
+
+        for (size_t row = blockIdx.x; row < rows; row += gridDim.x) {
+            const float4* x_row = x_vec + row * vec_size;
+            const float4* g_row = g_vec + row * vec_size;
+            float4* y_row = y_vec + row * vec_size;
+
+            // Step 1: 向量化 load + 拆包算 x²（每个 float4 装 8 个 BF16）
+            float sq_sum[Group] = {0.f};
+            for (size_t col_v = threadIdx.x; col_v < vec_size; col_v += blockDim.x) {
+                const float4 in_val = x_row[col_v];
+                const auto& bf_x = reinterpret_cast<const __nv_bfloat162&>(in_val.x);
+                const auto& bf_y = reinterpret_cast<const __nv_bfloat162&>(in_val.y);
+                const auto& bf_z = reinterpret_cast<const __nv_bfloat162&>(in_val.z);
+                const auto& bf_w = reinterpret_cast<const __nv_bfloat162&>(in_val.w);
+                float2 f_x = __bfloat1622float2(bf_x);
+                float2 f_y = __bfloat1622float2(bf_y);
+                float2 f_z = __bfloat1622float2(bf_z);
+                float2 f_w = __bfloat1622float2(bf_w);
+
+                size_t base = col_v * 8;
+                sq_sum[base / group_size] += f_x.x * f_x.x;
+                sq_sum[(base + 1) / group_size] += f_x.y * f_x.y;
+                sq_sum[(base + 2) / group_size] += f_y.x * f_y.x;
+                sq_sum[(base + 3) / group_size] += f_y.y * f_y.y;
+                sq_sum[(base + 4) / group_size] += f_z.x * f_z.x;
+                sq_sum[(base + 5) / group_size] += f_z.y * f_z.y;
+                sq_sum[(base + 6) / group_size] += f_w.x * f_w.x;
+                sq_sum[(base + 7) / group_size] += f_w.y * f_w.y;
+            }
+
+            block_group_reduce_sum<Group>(sq_sum);
+
+            float scale[Group];
+            #pragma unroll
+            for (int g = 0; g < Group; ++g)
+                scale[g] = rsqrtf(sq_sum[g] / static_cast<float>(group_size) + eps);
+
+            // Step 4: load x + gate，scale，打包 store
+            for (size_t col_v = threadIdx.x; col_v < vec_size; col_v += blockDim.x) {
+                const float4 in_val = x_row[col_v];
+                const float4 gate_val = g_row[col_v];
+
+                const auto& bf_x = reinterpret_cast<const __nv_bfloat162&>(in_val.x);
+                const auto& bf_y = reinterpret_cast<const __nv_bfloat162&>(in_val.y);
+                const auto& bf_z = reinterpret_cast<const __nv_bfloat162&>(in_val.z);
+                const auto& bf_w = reinterpret_cast<const __nv_bfloat162&>(in_val.w);
+
+                const auto& g_bf_x = reinterpret_cast<const __nv_bfloat162&>(gate_val.x);
+                const auto& g_bf_y = reinterpret_cast<const __nv_bfloat162&>(gate_val.y);
+                const auto& g_bf_z = reinterpret_cast<const __nv_bfloat162&>(gate_val.z);
+                const auto& g_bf_w = reinterpret_cast<const __nv_bfloat162&>(gate_val.w);
+
+                float2 f_x = __bfloat1622float2(bf_x);
+                float2 f_y = __bfloat1622float2(bf_y);
+                float2 f_z = __bfloat1622float2(bf_z);
+                float2 f_w = __bfloat1622float2(bf_w);
+
+                float2 gf_x = __bfloat1622float2(g_bf_x);
+                float2 gf_y = __bfloat1622float2(g_bf_y);
+                float2 gf_z = __bfloat1622float2(g_bf_z);
+                float2 gf_w = __bfloat1622float2(g_bf_w);
+
+                const float* w_col = w + col_v * 8;
+                size_t base = col_v * 8;
+                f_x.x *= scale[base / group_size] * w_col[0] * gf_x.x;
+                f_x.y *= scale[(base + 1) / group_size] * w_col[1] * gf_x.y;
+                f_y.x *= scale[(base + 2) / group_size] * w_col[2] * gf_y.x;
+                f_y.y *= scale[(base + 3) / group_size] * w_col[3] * gf_y.y;
+                f_z.x *= scale[(base + 4) / group_size] * w_col[4] * gf_z.x;
+                f_z.y *= scale[(base + 5) / group_size] * w_col[5] * gf_z.y;
+                f_w.x *= scale[(base + 6) / group_size] * w_col[6] * gf_w.x;
+                f_w.y *= scale[(base + 7) / group_size] * w_col[7] * gf_w.y;
+
+                __nv_bfloat162 out_x = __float22bfloat162_rn(f_x);
+                __nv_bfloat162 out_y = __float22bfloat162_rn(f_y);
+                __nv_bfloat162 out_z = __float22bfloat162_rn(f_z);
+                __nv_bfloat162 out_w = __float22bfloat162_rn(f_w);
+
+                y_row[col_v] = make_float4(
+                    reinterpret_cast<const float&>(out_x),
+                    reinterpret_cast<const float&>(out_y),
+                    reinterpret_cast<const float&>(out_z),
+                    reinterpret_cast<const float&>(out_w)
+                );
+            }
+
+            __syncthreads();
+        }
+    }
+
+
+    template<int Group>
+    __global__ void rmsnorm_gated_launch_bf16(
+        const __nv_bfloat16* __restrict__ x,
+        __nv_bfloat16* __restrict__ y,
+        const float* __restrict__ w,
+        const __nv_bfloat16* __restrict__ gate,
+        const size_t rows,
+        const size_t cols,
+        const size_t group_size,
+        const float eps
+    ) {
+        rmsnorm_gated_kernel_bf16<Group>(x, y, w, gate, rows, cols, group_size, eps);
+    }
+
+
+    template<int Group>
+    __host__ void rmsnorm_gated_bf16(
+        const __nv_bfloat16* in0,
+        __nv_bfloat16* out0,
+        const float* weight,
+        const __nv_bfloat16* gate,
+        const size_t rows,
+        const size_t cols,
+        const size_t group_size,
+        const float eps = 1e-5f,
+        cudaStream_t stream = nullptr
+    ) {
+        constexpr int block_dimx = 256;
+        const int grid_dimx = min(rows, static_cast<size_t>(8192));
+        rmsnorm_gated_launch_bf16<Group><<<grid_dimx, block_dimx, 0, stream>>>(
+            in0, out0, weight, gate, rows, cols, group_size, eps
+        );
     }
 }
 
