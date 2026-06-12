@@ -510,6 +510,153 @@ namespace nemotron::ops {
             in0, out0, weight, gate, rows, cols, group_size, eps
         );
     }
+
+
+    // ===========================================================================
+    // Segmented Cumsum — 下三角衰减矩阵
+    // ===========================================================================
+
+    /**
+     * 输入已经算好的 cumsum A_cum [L]，输出下三角矩阵
+     * L[t][s] = exp(A_cum[t] - A_cum[s])  s ≤ t
+     *            0                          s > t
+     *
+     * 每 block 处理一个 (b, h, c, t) 的行，grid = B * H * C * L
+     * block 内 threads 对齐 L
+     */
+    template<int L>
+    __device__ __forceinline__ void segment_sum_kernel_fp32(
+        const float* __restrict__ A_cum,      // [num_triplets, L]
+        float* __restrict__ L_out,            // [num_triplets, L, L]
+        const size_t num_triplets             // B * H * C
+    ) {
+        // 每个 block 处理一行 t，多个 triplets 通过 grid-stride loop 覆盖
+        for (size_t idx = blockIdx.x; idx < num_triplets * L; idx += gridDim.x) {
+            const size_t triplet = idx / L;   // 哪个 (b,h,c)
+            const size_t t = idx % L;         // 行号
+
+            const float* A = A_cum + triplet * L;
+            float* L_row = L_out + triplet * L * L + t * L;
+
+            const float A_t = A[t];           // 所有列共享这个值
+
+            // 每个线程算自己那列的 L[t][s]
+            for (size_t s = threadIdx.x; s < L; s += blockDim.x) {
+                L_row[s] = (s <= t) ? expf(A_t - A[s]) : 0.f;
+            }
+        }
+    }
+
+    template<int L>
+    __global__ void segment_sum_launch_fp32(
+        const float* __restrict__ A_cum,
+        float* __restrict__ L_out,
+        const size_t num_triplets
+    ) {
+        segment_sum_kernel_fp32<L>(A_cum, L_out, num_triplets);
+    }
+
+    template<int L>
+    __host__ void segment_sum_fp32(
+        const float* A_cum,
+        float* L_out,
+        const size_t num_triplets,
+        cudaStream_t stream = nullptr
+    ) {
+        constexpr int block_dimx = L;         // 一行一个 block，线程数 = chunk_size
+        const int grid_dimx = min((size_t)(num_triplets * L), (size_t)16384);
+        segment_sum_launch_fp32<L><<<grid_dimx, block_dimx, 0, stream>>>(
+            A_cum, L_out, num_triplets
+        );
+    }
+
+
+    // ===========================================================================
+    // BF16 版本 — float4 向量化 load/store（一次处理 8 个 BF16），内部 FP32 计算
+    // ===========================================================================
+    template<int L>
+    __device__ __forceinline__ void segment_sum_kernel_bf16(
+        const __nv_bfloat16* __restrict__ A_cum,
+        __nv_bfloat16* __restrict__ L_out,
+        const size_t num_triplets
+    ) {
+        constexpr int VEC = 8;
+        const auto A_vec = reinterpret_cast<const float4*>(A_cum);
+
+        for (size_t idx = blockIdx.x; idx < num_triplets * L; idx += gridDim.x) {
+            const size_t triplet = idx / L;
+            const size_t t = idx % L;
+
+            const float4* A4 = A_vec + triplet * (L / VEC);
+            auto* L_row = reinterpret_cast<float4*>(L_out + triplet * L * L + t * L);
+
+            // ① 标量读 A[t]
+            const int t_vec = t / VEC;
+            const int t_off = t % VEC;
+            const float A_t = __bfloat162float(
+                reinterpret_cast<const __nv_bfloat16*>(A4 + t_vec)[t_off]
+            );
+
+            // ② 向量化 load 8 个 A[s]（一次 float4）
+            const size_t s_vec = threadIdx.x;
+            const float4 a_val = A4[s_vec];
+            const auto& bf_x = reinterpret_cast<const __nv_bfloat162&>(a_val.x);
+            const auto& bf_y = reinterpret_cast<const __nv_bfloat162&>(a_val.y);
+            const auto& bf_z = reinterpret_cast<const __nv_bfloat162&>(a_val.z);
+            const auto& bf_w = reinterpret_cast<const __nv_bfloat162&>(a_val.w);
+            float2 f_x = __bfloat1622float2(bf_x);
+            float2 f_y = __bfloat1622float2(bf_y);
+            float2 f_z = __bfloat1622float2(bf_z);
+            float2 f_w = __bfloat1622float2(bf_w);
+
+            // ③ FP32 计算，逐列判断下三角
+            size_t s_base = s_vec * VEC;
+            if (s_base <= t) f_x.x = expf(A_t - f_x.x); else f_x.x = 0.f; s_base++;
+            if (s_base <= t) f_x.y = expf(A_t - f_x.y); else f_x.y = 0.f; s_base++;
+            if (s_base <= t) f_y.x = expf(A_t - f_y.x); else f_y.x = 0.f; s_base++;
+            if (s_base <= t) f_y.y = expf(A_t - f_y.y); else f_y.y = 0.f; s_base++;
+            if (s_base <= t) f_z.x = expf(A_t - f_z.x); else f_z.x = 0.f; s_base++;
+            if (s_base <= t) f_z.y = expf(A_t - f_z.y); else f_z.y = 0.f; s_base++;
+            if (s_base <= t) f_w.x = expf(A_t - f_w.x); else f_w.x = 0.f; s_base++;
+            if (s_base <= t) f_w.y = expf(A_t - f_w.y); else f_w.y = 0.f;
+
+            // ④ 向量化 store 8 个结果（一次 float4）
+            __nv_bfloat162 out_x = __float22bfloat162_rn(f_x);
+            __nv_bfloat162 out_y = __float22bfloat162_rn(f_y);
+            __nv_bfloat162 out_z = __float22bfloat162_rn(f_z);
+            __nv_bfloat162 out_w = __float22bfloat162_rn(f_w);
+
+            L_row[s_vec] = make_float4(
+                reinterpret_cast<const float&>(out_x),
+                reinterpret_cast<const float&>(out_y),
+                reinterpret_cast<const float&>(out_z),
+                reinterpret_cast<const float&>(out_w)
+            );
+        }
+    }
+
+    template<int L>
+    __global__ void segment_sum_launch_bf16(
+        const __nv_bfloat16* __restrict__ A_cum,
+        __nv_bfloat16* __restrict__ L_out,
+        const size_t num_triplets
+    ) {
+        segment_sum_kernel_bf16<L>(A_cum, L_out, num_triplets);
+    }
+
+    template<int L>
+    __host__ void segment_sum_bf16(
+        const __nv_bfloat16* A_cum,
+        __nv_bfloat16* L_out,
+        const size_t num_triplets,
+        cudaStream_t stream = nullptr
+    ) {
+        constexpr int block_dimx = L / 8;
+        const int grid_dimx = min(num_triplets * L, static_cast<size_t>(65535));
+        segment_sum_launch_bf16<L><<<grid_dimx, block_dimx, 0, stream>>>(
+            A_cum, L_out, num_triplets
+        );
+    }
 }
 
 

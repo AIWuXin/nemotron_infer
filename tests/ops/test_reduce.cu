@@ -523,17 +523,6 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_FullMamba) {
             w.data(), gate.data() + r * cols, cols, group_size, 1e-5f
         );
 
-    // --- 调试：打印行 0 各组 sq_sum ---
-    for (int g = 0; g < 8; g++) {
-        float sum_sq = 0.f;
-        for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-            sum_sq += x[i] * x[i];
-        printf(
-            "  [Ref]  Group %d: sum_sq=%.2f scale=%.4f\n", g, sum_sq,
-            1.f / std::sqrt(sum_sq / group_size + 1e-5f)
-        );
-    }
-
     auto d_x = allocate_tensor<float>(TensorShape::make_1d(rows * cols));
     auto d_y = allocate_tensor_zeros<float>(TensorShape::make_1d(rows * cols));
     auto d_w = allocate_tensor<float>(TensorShape::make_1d(cols));
@@ -551,24 +540,6 @@ TEST_F(RMSNormGatedCorrectnessTest, FP32_FullMamba) {
 
     copy_device_to_host(out.data(), d_y);
     cudaDeviceSynchronize();
-
-    // --- 调试：打印 GPU 行 0 第一个元素，对比参考 ---
-    printf(
-        "  [GPU]  Row 0 col 0: out=%.6f expected=%.6f ratio=%.4f\n",
-        out[0], expected[0], out[0] / expected[0]
-    );
-    printf(
-        "  [GPU]  Row 0 col 960 (group 1): out=%.6f expected=%.6f ratio=%.4f\n",
-        out[960], expected[960], out[960] / expected[960]
-    );
-    printf(
-        "  [GPU]  Row 0 col 1920 (group 2): out=%.6f expected=%.6f ratio=%.4f\n",
-        out[1920], expected[1920], out[1920] / expected[1920]
-    );
-    printf(
-        "  [GPU]  Row 0 col 6720 (group 7): out=%.6f expected=%.6f ratio=%.4f\n",
-        out[6720], expected[6720], out[6720] / expected[6720]
-    );
 
     for (size_t i = 0; i < rows * cols; ++i)
         EXPECT_NEAR(out[i], expected[i], 1e-5f) << " at index " << i;
@@ -725,5 +696,347 @@ TEST_F(RMSNormGatedComparisonTest, Speedup) {
         "  [Compare] RMSNorm Gated       FP32: %6.3f ms (%5.1f GB/s) | BF16: %6.3f ms (%5.1f GB/s) | Speedup: %.2f x\n",
         fp32_ms, fp32_bw, bf16_ms, bf16_bw, speedup
     );
+    EXPECT_GT(speedup, 0.5);
+}
+
+// ===========================================================================
+// 9. Segmented Cumsum 正确性 + 性能测试
+// ===========================================================================
+
+namespace ref {
+
+void segment_sum(const float* A_cum, float* L, size_t chunk_size, size_t num_triplets) {
+    for (size_t n = 0; n < num_triplets; ++n) {
+        const float* A = A_cum + n * chunk_size;
+        float* L_n = L + n * chunk_size * chunk_size;
+        for (size_t t = 0; t < chunk_size; ++t) {
+            float A_t = A[t];
+            for (size_t s = 0; s < chunk_size; ++s)
+                L_n[t * chunk_size + s] = (s <= t) ? std::exp(A_t - A[s]) : 0.f;
+        }
+    }
+}
+
+}  // namespace ref
+
+class SegmentedCumsumTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        default_allocator().reset();
+        warmup_gpu();
+    }
+};
+
+TEST_F(SegmentedCumsumTest, FP32_Small) {
+    constexpr size_t L = 8, M = 2;  // 2 组 triplets, 每组 chunk_size=8
+    const size_t NN = M * L;
+
+    // 生成 log-space 衰减因子 [-3, 0]
+    std::vector<float> A_cum(NN);
+    for (size_t i = 0; i < NN; ++i)
+        A_cum[i] = -float(i % L) * 0.2f;  // 递减的 cumsum
+
+    std::vector<float> expected(M * L * L), out(M * L * L);
+    ref::segment_sum(A_cum.data(), expected.data(), L, M);
+
+    auto d_A = allocate_tensor<float>(TensorShape::make_1d(NN));
+    auto d_L = allocate_tensor_zeros<float>(TensorShape::make_1d(M * L * L));
+    copy_host_to_device(d_A, A_cum.data());
+    cudaDeviceSynchronize();
+
+    segment_sum_fp32<L>(d_A.data_, d_L.data_, M);
+    cudaDeviceSynchronize();
+
+    copy_device_to_host(out.data(), d_L);
+    cudaDeviceSynchronize();
+
+    for (size_t n = 0; n < M; ++n) {
+        // 验证下三角结构
+        for (size_t t = 0; t < L; ++t) {
+            for (size_t s = 0; s < L; ++s) {
+                size_t idx = n * L * L + t * L + s;
+                if (s > t) {
+                    EXPECT_FLOAT_EQ(out[idx], 0.f) << " upper-tri should be 0 at t=" << t << " s=" << s;
+                } else {
+                    EXPECT_NEAR(out[idx], expected[idx], 1e-5f) << " at triplet=" << n << " t=" << t << " s=" << s;
+                }
+            }
+        }
+    }
+
+    free_tensor(d_A); free_tensor(d_L);
+}
+
+TEST_F(SegmentedCumsumTest, FP32_FullChunk) {
+    // Mamba 真实 chunk_size=256, 4 组 triplets
+    constexpr size_t L = 256, M = 4;
+    const size_t NN = M * L;
+
+    std::vector<float> A_cum(NN);
+    for (size_t i = 0; i < NN; ++i)
+        A_cum[i] = float(i % L) * -0.05f;  // 递减, 到结尾 exp(-12.75) ≈ 3e-6
+
+    std::vector<float> expected(M * L * L), out(M * L * L);
+    ref::segment_sum(A_cum.data(), expected.data(), L, M);
+
+    auto d_A = allocate_tensor<float>(TensorShape::make_1d(NN));
+    auto d_L = allocate_tensor_zeros<float>(TensorShape::make_1d(M * L * L));
+    copy_host_to_device(d_A, A_cum.data());
+    cudaDeviceSynchronize();
+
+    segment_sum_fp32<L>(d_A.data_, d_L.data_, M);
+    cudaDeviceSynchronize();
+
+    copy_device_to_host(out.data(), d_L);
+    cudaDeviceSynchronize();
+
+    // 抽样验证最上面几行和尾行，不全量 65536 元素
+    size_t n = 0;
+    for (size_t t : {0, 1, 2, 127, 128, 254, 255}) {
+        // 验证对角线 exp(0) ≈ 1
+        size_t diag = n * L * L + t * L + t;
+        EXPECT_NEAR(out[diag], 1.0f, 1e-5f) << " diag t=" << t;
+        // 验证上三角全是 0
+        if (t < L - 1) {
+            size_t upper = n * L * L + t * L + t + 1;
+            EXPECT_FLOAT_EQ(out[upper], 0.f) << " upper at t=" << t;
+        }
+    }
+
+    free_tensor(d_A); free_tensor(d_L);
+}
+
+// ===========================================================================
+// 10. Segmented Cumsum 性能基准
+// ===========================================================================
+
+class SegmentedCumsumPerfTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        default_allocator().reset();
+        warmup_gpu();
+
+        if (!d_A.data_) {
+            d_A = allocate_tensor<float>(TensorShape::make_1d(M * L));
+            d_L = allocate_tensor_zeros<float>(TensorShape::make_1d(M * L * L));
+        }
+
+        h_buf.resize(M * L);
+        for (size_t i = 0; i < M * L; ++i)
+            h_buf[i] = -float(i % L) * 0.05f;
+        copy_host_to_device(d_A, h_buf.data());
+        cudaDeviceSynchronize();
+    }
+
+    static constexpr size_t L = 256;
+    static constexpr size_t M = 128;  // 128 个独立 cumsum, 模拟 B=1,H=8,C=16
+    Tensor<float> d_A, d_L;
+    std::vector<float> h_buf;
+};
+
+TEST_F(SegmentedCumsumPerfTest, FP32_Bandwidth) {
+    int warmup_iters = 3, bench_iters = 10;
+    for (int i = 0; i < warmup_iters; ++i)
+        segment_sum_fp32<L>(d_A.data_, d_L.data_, M);
+    cudaDeviceSynchronize();
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < bench_iters; ++i)
+        segment_sum_fp32<L>(d_A.data_, d_L.data_, M);
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / bench_iters;
+
+    size_t write_bytes = M * L * L * sizeof(float);  // 写整个 L 矩阵
+    size_t read_bytes = M * L * sizeof(float);        // 读 A_cum
+    double bw = (write_bytes + read_bytes) / (ms * 1e6);
+    printf("  [Perf] SegmentSum FP32:  %6.3f ms | %7.2f GB/s | %zu triplets x %zu x %zu (%zu MB out)\n",
+           ms, bw, (size_t)M, (size_t)L, (size_t)L, write_bytes / (1024 * 1024));
+
+    // 只在 FP32 测试里验证计算带宽合理（expf 密集）
+    EXPECT_GT(bw, 10.0);
+}
+
+// ===========================================================================
+// 11. BF16 Segmented Cumsum 正确性
+// ===========================================================================
+
+namespace ref {
+
+void segment_sum_bf16(const float* A_cum_fp32, float* L, size_t chunk_size, size_t num_triplets) {
+    // 模拟 BF16 IO: cumsum 读入时量化一次，exp 在 FP32 算，输出再量化一次
+    for (size_t n = 0; n < num_triplets; ++n) {
+        const float* A = A_cum_fp32 + n * chunk_size;
+        float* L_n = L + n * chunk_size * chunk_size;
+        for (size_t t = 0; t < chunk_size; ++t) {
+            float A_t = __bfloat162float(__float2bfloat16_rn(A[t]));
+            for (size_t s = 0; s < chunk_size; ++s) {
+                if (s <= t) {
+                    float diff = A_t - __bfloat162float(__float2bfloat16_rn(A[s]));
+                    L_n[t * chunk_size + s] = __bfloat162float(__float2bfloat16_rn(expf(diff)));
+                } else {
+                    L_n[t * chunk_size + s] = 0.f;
+                }
+            }
+        }
+    }
+}
+
+}  // namespace ref
+
+class SegmentedCumsumBF16Test : public ::testing::Test {
+protected:
+    void SetUp() override {
+        default_allocator().reset();
+        warmup_gpu();
+    }
+};
+
+TEST_F(SegmentedCumsumBF16Test, Small) {
+    constexpr size_t L = 8, M = 2;
+
+    std::vector<float> A_cum(M * L);
+    for (size_t i = 0; i < M * L; ++i)
+        A_cum[i] = -float(i % L) * 0.2f;
+
+    std::vector<float> expected(M * L * L), out_fp32(M * L * L);
+    ref::segment_sum_bf16(A_cum.data(), expected.data(), L, M);
+
+    std::vector<bfloat16_t> A_bf16(M * L);
+    for (size_t i = 0; i < M * L; ++i)
+        A_bf16[i] = __float2bfloat16_rn(A_cum[i]);
+
+    auto d_A = allocate_tensor<bfloat16_t>(TensorShape::make_1d(M * L));
+    auto d_L = allocate_tensor_zeros<bfloat16_t>(TensorShape::make_1d(M * L * L));
+    copy_host_to_device(d_A, A_bf16.data());
+    cudaDeviceSynchronize();
+
+    segment_sum_bf16<L>(d_A.data_, d_L.data_, M);
+    cudaDeviceSynchronize();
+
+    std::vector<bfloat16_t> out_bf16(M * L * L);
+    copy_device_to_host(out_bf16.data(), d_L);
+    cudaDeviceSynchronize();
+
+    for (size_t i = 0; i < M * L * L; ++i) {
+        out_fp32[i] = __bfloat162float(out_bf16[i]);
+        EXPECT_NEAR(out_fp32[i], expected[i], 0.01f) << " at index " << i;
+    }
+
+    free_tensor(d_A); free_tensor(d_L);
+}
+
+TEST_F(SegmentedCumsumBF16Test, FullChunk) {
+    constexpr size_t L = 256, M = 4;
+
+    std::vector<float> A_cum(M * L);
+    for (size_t i = 0; i < M * L; ++i)
+        A_cum[i] = float(i % L) * -0.05f;
+
+    std::vector<float> expected(M * L * L);
+    ref::segment_sum_bf16(A_cum.data(), expected.data(), L, M);
+
+    std::vector<bfloat16_t> A_bf16(M * L);
+    for (size_t i = 0; i < M * L; ++i)
+        A_bf16[i] = __float2bfloat16_rn(A_cum[i]);
+
+    auto d_A = allocate_tensor<bfloat16_t>(TensorShape::make_1d(M * L));
+    auto d_L = allocate_tensor_zeros<bfloat16_t>(TensorShape::make_1d(M * L * L));
+    copy_host_to_device(d_A, A_bf16.data());
+    cudaDeviceSynchronize();
+
+    segment_sum_bf16<L>(d_A.data_, d_L.data_, M);
+    cudaDeviceSynchronize();
+
+    std::vector<bfloat16_t> out_bf16(M * L * L);
+    copy_device_to_host(out_bf16.data(), d_L);
+    cudaDeviceSynchronize();
+
+    // 验证下三角结构
+    size_t n = 0;
+    for (size_t t : {0, 1, 127, 255}) {
+        size_t diag = n * L * L + t * L + t;
+        float diag_val = __bfloat162float(out_bf16[diag]);
+        EXPECT_NEAR(diag_val, 1.0f, 0.05f) << " diag t=" << t;
+        if (t < L - 1) {
+            size_t upper = n * L * L + t * L + t + 1;
+            EXPECT_FLOAT_EQ(__bfloat162float(out_bf16[upper]), 0.f) << " upper at t=" << t;
+        }
+    }
+
+    free_tensor(d_A); free_tensor(d_L);
+}
+
+// ===========================================================================
+// 12. BF16 Segmented Cumsum 性能 + FP32 vs BF16 对比
+// ===========================================================================
+
+class SegmentedCumsumComparisonTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        default_allocator().reset();
+        warmup_gpu();
+
+        if (!fp32_A.data_) {
+            fp32_A = allocate_tensor<float>(TensorShape::make_1d(M * L));
+            fp32_L = allocate_tensor_zeros<float>(TensorShape::make_1d(M * L * L));
+        }
+        if (!bf16_A.data_) {
+            bf16_A = allocate_tensor<bfloat16_t>(TensorShape::make_1d(M * L));
+            bf16_L = allocate_tensor_zeros<bfloat16_t>(TensorShape::make_1d(M * L * L));
+        }
+
+        h_fp32.resize(M * L);
+        for (size_t i = 0; i < M * L; ++i)
+            h_fp32[i] = -float(i % L) * 0.05f;
+        std::vector<bfloat16_t> h_bf16(M * L);
+        for (size_t i = 0; i < M * L; ++i)
+            h_bf16[i] = __float2bfloat16_rn(h_fp32[i]);
+
+        copy_host_to_device(fp32_A, h_fp32.data());
+        copy_host_to_device(bf16_A, h_bf16.data());
+        cudaDeviceSynchronize();
+    }
+
+    static constexpr size_t L = 256;
+    static constexpr size_t M = 1024;
+    Tensor<float> fp32_A, fp32_L;
+    Tensor<bfloat16_t> bf16_A, bf16_L;
+    std::vector<float> h_fp32;
+};
+
+TEST_F(SegmentedCumsumComparisonTest, Speedup) {
+    int warmup_iters = 3, bench_iters = 10;
+
+    // FP32
+    for (int i = 0; i < warmup_iters; ++i)
+        segment_sum_fp32<L>(fp32_A.data_, fp32_L.data_, M);
+    cudaDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < bench_iters; ++i)
+        segment_sum_fp32<L>(fp32_A.data_, fp32_L.data_, M);
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double fp32_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / bench_iters;
+
+    // BF16
+    for (int i = 0; i < warmup_iters; ++i)
+        segment_sum_bf16<L>(bf16_A.data_, bf16_L.data_, M);
+    cudaDeviceSynchronize();
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < bench_iters; ++i)
+        segment_sum_bf16<L>(bf16_A.data_, bf16_L.data_, M);
+    cudaDeviceSynchronize();
+    t1 = std::chrono::high_resolution_clock::now();
+    double bf16_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / bench_iters;
+
+    double speedup = fp32_ms / bf16_ms;
+    size_t fp32_traffic = M * L * L * sizeof(float) + M * L * sizeof(float);
+    size_t bf16_traffic = M * L * L * sizeof(bfloat16_t) + M * L * sizeof(bfloat16_t);
+    double fp32_bw = fp32_traffic / (fp32_ms * 1e6);
+    double bf16_bw = bf16_traffic / (bf16_ms * 1e6);
+
+    printf("  [Compare] SegmentSum       FP32: %6.3f ms (%5.1f GB/s) | BF16: %6.3f ms (%5.1f GB/s) | Speedup: %.2f x\n",
+           fp32_ms, fp32_bw, bf16_ms, bf16_bw, speedup);
     EXPECT_GT(speedup, 0.5);
 }
