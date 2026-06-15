@@ -183,3 +183,5 @@ cython_debug/
 model/
 third_party/
 cmake-build-debug/
+cmake-build-cudnn/
+cmake-build-release/
