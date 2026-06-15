@@ -157,6 +157,7 @@ target_link_libraries(nemotron_infer PRIVATE
         glog::glog
         CUDA::cudart
         CUDA::cublas
+        CUDA::cublasLt
 )
 
 set_target_properties(
@@ -216,6 +217,7 @@ target_link_libraries(
         pybind11::module       # 关键：链接 pybind11
         CUDA::cudart
         CUDA::cublas
+        CUDA::cublasLt
         glog::glog
         GTest::gtest
         GTest::gtest_main
