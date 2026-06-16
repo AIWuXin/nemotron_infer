@@ -213,6 +213,66 @@ TEST_F(SDPADecodeFP32Test, MultiStep) {
     free_tensor(d_O); free_tensor(d_Knew); free_tensor(d_Vnew);
 }
 
+// GQA：Hq query heads 共享 Hkv KV heads；cache/K_new 按 kv_head 索引
+TEST_F(SDPADecodeFP32Test, GQASingleStep) {
+    const int Hq = 4, Hkv = 2, HEAD = 128, S = 32, TOTAL_S = 64;
+    const int ratio = Hq / Hkv;
+
+    auto Kkv = rand_vec(Hkv * S * HEAD);   // K/V cache 仅 Hkv 头
+    auto Vkv = rand_vec(Hkv * S * HEAD);
+    auto Q   = rand_vec(Hq * HEAD);
+    std::vector<float> expected(Hq * HEAD), out(Hq * HEAD);
+
+    for (int h = 0; h < Hq; ++h) {
+        int kvh = h / ratio;
+        ref::sdpa_decode_fp32(Q.data() + h * HEAD,
+                              Kkv.data() + (size_t)kvh * S * HEAD,
+                              Vkv.data() + (size_t)kvh * S * HEAD,
+                              expected.data() + h * HEAD, S, HEAD);
+    }
+
+    auto d_K = allocate_tensor<float>(TensorShape::make_1d(Hkv * TOTAL_S * HEAD));
+    auto d_V = allocate_tensor<float>(TensorShape::make_1d(Hkv * TOTAL_S * HEAD));
+    auto d_O = allocate_tensor_zeros<float>(TensorShape::make_1d(Hq * HEAD));
+    auto d_Q = allocate_tensor<float>(TensorShape::make_1d(Hq * HEAD));
+    auto d_Kn = allocate_tensor<float>(TensorShape::make_1d(Hkv * HEAD));
+    auto d_Vn = allocate_tensor<float>(TensorShape::make_1d(Hkv * HEAD));
+
+    std::vector<float> initK(Hkv * TOTAL_S * HEAD, 0.f), initV(Hkv * TOTAL_S * HEAD, 0.f);
+    for (int h = 0; h < Hkv; ++h)
+        for (int s = 0; s < S; ++s)
+            for (int d = 0; d < HEAD; ++d) {
+                initK[h * TOTAL_S * HEAD + s * HEAD + d] = Kkv[h * S * HEAD + s * HEAD + d];
+                initV[h * TOTAL_S * HEAD + s * HEAD + d] = Vkv[h * S * HEAD + s * HEAD + d];
+            }
+    std::vector<float> Knew_h(Hkv * HEAD), Vnew_h(Hkv * HEAD);
+    for (auto& v : Knew_h) v = float(rand())/RAND_MAX-0.5f;
+    for (auto& v : Vnew_h) v = float(rand())/RAND_MAX-0.5f;
+    copy_host_to_device(d_K, initK.data()); copy_host_to_device(d_V, initV.data());
+    copy_host_to_device(d_Q, Q.data());
+    copy_host_to_device(d_Kn, Knew_h.data()); copy_host_to_device(d_Vn, Vnew_h.data());
+    cudaDeviceSynchronize();
+
+    sdpa_decode_fp32<HEAD>(d_Q.data_, d_K.data_, d_V.data_, d_O.data_,
+                           d_Kn.data_, d_Vn.data_, S, TOTAL_S, Hq, Hkv);
+    cudaDeviceSynchronize();
+
+    copy_device_to_host(out.data(), d_O); cudaDeviceSynchronize();
+    for (int i = 0; i < Hq * HEAD; ++i)
+        EXPECT_NEAR(out[i], expected[i], 1e-4f) << " at index " << i;
+
+    // K_new 按 kv_head 追加到 position S（每个 kv 头一次）
+    std::vector<float> readback(Hkv * TOTAL_S * HEAD);
+    copy_device_to_host(readback.data(), d_K); cudaDeviceSynchronize();
+    for (int h = 0; h < Hkv; ++h)
+        for (int d = 0; d < HEAD; ++d)
+            EXPECT_FLOAT_EQ(readback[h * TOTAL_S * HEAD + S * HEAD + d], Knew_h[h * HEAD + d])
+                << " kv append h=" << h << " d=" << d;
+
+    free_tensor(d_Q); free_tensor(d_K); free_tensor(d_V);
+    free_tensor(d_O); free_tensor(d_Kn); free_tensor(d_Vn);
+}
+
 // ===========================================================================
 // 4. BF16 正确性
 // ===========================================================================

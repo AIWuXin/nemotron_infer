@@ -167,6 +167,19 @@ struct Tensor {
         return view;
     }
 
+    /// 沿第 dim_idx 维做区间切片 [start, start+length)，保留该维（零拷贝）。
+    /// 仅偏移 data_ 并缩小该维长度，strides 全部不变——故切非最末维或在最末维
+    /// 取子段时会得到 strided（非连续）视图，下游 kernel 须按 stride 访问。
+    /// 用于 Mamba in_proj 输出 [z|x|B|C|dt] 与 conv 输出 [x|B|C] 的免拷贝切分。
+    CUDA_HOST_DEVICE Tensor<T> view_narrow(int dim_idx, int64_t start, int64_t length) const {
+        Tensor<T> view;
+        view.data_  = data_ + start * stride(dim_idx);
+        view.shape_ = shape_;
+        view.shape_.dims[dim_idx] = length;
+        view.owner_ = false;
+        return view;
+    }
+
     /// 将前两维合并（[B,S,D] -> [B*S,D]），用于 gemm 批量处理
     Tensor<T> view_2d(int64_t d0, int64_t d1) const {
         Tensor<T> view;

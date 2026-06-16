@@ -47,7 +47,8 @@ __device__ __forceinline__ void ssm_decode_dev(
     float* __restrict__ state,          // [B, H, D, N]  恒 fp32
     IoT* __restrict__ y,                // [B, H*D]
     const float* __restrict__ dt_bias,  // [H]  optional
-    const int batch, const int n_groups
+    const int batch, const int n_groups,
+    const float dt_min, const float dt_max
 ) {
     const int head = blockIdx.x;
     if (head >= H * batch) return;
@@ -69,10 +70,12 @@ __device__ __forceinline__ void ssm_decode_dev(
     __syncthreads();
 
     // dt 离散化 softplus+clamp（每线程算同一标量，便宜）
+    // clamp 上下界由调用方传入：本模型 dt_limit=(0,inf) → (dt_min=0, dt_max=FLT_MAX)，
+    // 即只 softplus 不截断；与 SSD scan prefill 保持一致（衔接同一条 state）。
     float dt_v = ssm_to_f(dt[b_idx * H + h]);
     if (dt_bias) dt_v += dt_bias[h];
     const float sp = (dt_v > 20.f) ? dt_v : (dt_v < -20.f) ? 0.f : logf(1.f + expf(dt_v));
-    dt_v = fminf(0.1f, fmaxf(0.001f, sp));
+    dt_v = fminf(dt_max, fmaxf(dt_min, sp));
     const float dA = expf(dt_v * (-expf(A_log[h]) * dt_v));   // 衰减因子
     const float Dh = D_param[h];
 
@@ -103,10 +106,11 @@ __global__ void ssm_decode_fp32(
     const float* __restrict__ A_log, const float* __restrict__ B,
     const float* __restrict__ C, const float* __restrict__ D_param,
     float* __restrict__ state, float* __restrict__ y,
-    const float* __restrict__ dt_bias, const int batch, const int n_groups
+    const float* __restrict__ dt_bias, const int batch, const int n_groups,
+    const float dt_min = 0.f, const float dt_max = FLT_MAX
 ) {
     ssm_decode_dev<float, H, D, N>(x, dt, A_log, B, C, D_param, state, y,
-                                   dt_bias, batch, n_groups);
+                                   dt_bias, batch, n_groups, dt_min, dt_max);
 }
 
 template<int H, int D, int N>
@@ -115,10 +119,11 @@ __global__ void ssm_decode_bf16(
     const float* __restrict__ A_log, const __nv_bfloat16* __restrict__ B,
     const __nv_bfloat16* __restrict__ C, const float* __restrict__ D_param,
     float* __restrict__ state, __nv_bfloat16* __restrict__ y,
-    const float* __restrict__ dt_bias, const int batch, const int n_groups
+    const float* __restrict__ dt_bias, const int batch, const int n_groups,
+    const float dt_min = 0.f, const float dt_max = FLT_MAX
 ) {
     ssm_decode_dev<__nv_bfloat16, H, D, N>(x, dt, A_log, B, C, D_param, state, y,
-                                           dt_bias, batch, n_groups);
+                                           dt_bias, batch, n_groups, dt_min, dt_max);
 }
 
 }  // namespace nemotron::ops::mamba2

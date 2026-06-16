@@ -169,7 +169,8 @@ __global__ void sdpa_prefill_launch_fp32(
     float* __restrict__ O,
     const float rsqrt_d,
     const int S,
-    const int num_heads
+    const int num_heads,
+    const int num_kv_heads
 ) {
     extern __shared__ float smem[];
     float* Q_shared = smem;
@@ -177,11 +178,13 @@ __global__ void sdpa_prefill_launch_fp32(
     float* V_shared = smem + 2 * Bc * HEAD;
 
     const int head = blockIdx.x;
-    const size_t head_offset = (size_t)head * S * HEAD;
+    const int kv_head = head / (num_heads / num_kv_heads);   // GQA：组内 query 共享 kv
+    const size_t q_off  = (size_t)head    * S * HEAD;
+    const size_t kv_off = (size_t)kv_head * S * HEAD;
 
     sdpa_prefill_kernel_fp32<Bc, HEAD>(
-        Q + head_offset, K + head_offset, V + head_offset,
-        O + head_offset,
+        Q + q_off, K + kv_off, V + kv_off,
+        O + q_off,
         rsqrt_d, S,
         Q_shared, K_shared, V_shared
     );
@@ -198,9 +201,11 @@ __host__ void sdpa_prefill_fp32(
     float* O,
     const int S,
     const int num_heads,
+    int num_kv_heads = -1,            // GQA：K/V 头数；-1 表示与 num_heads 相同（MHA）
     cudaStream_t stream = nullptr
 ) {
     if (S == 0 || num_heads == 0) return;
+    if (num_kv_heads <= 0) num_kv_heads = num_heads;
 
     const float rsqrt_d = 1.f / sqrtf((float)HEAD);
     const dim3 block(Bc, Bc, 1);
@@ -208,7 +213,7 @@ __host__ void sdpa_prefill_fp32(
     const size_t smem_bytes = 3 * Bc * HEAD * sizeof(float);  // 48 KB
 
     sdpa_prefill_launch_fp32<Bc, HEAD><<<grid, block, smem_bytes, stream>>>(
-        Q, K, V, O, rsqrt_d, S, num_heads
+        Q, K, V, O, rsqrt_d, S, num_heads, num_kv_heads
     );
 }
 
@@ -330,7 +335,8 @@ __global__ void sdpa_prefill_launch_bf16(
     __nv_bfloat16* __restrict__ O,
     const float rsqrt_d,
     const int S,
-    const int num_heads
+    const int num_heads,
+    const int num_kv_heads
 ) {
     extern __shared__ float smem[];
     float* Q_shared = smem;
@@ -338,11 +344,13 @@ __global__ void sdpa_prefill_launch_bf16(
     float* V_shared = smem + 2 * Bc * HEAD;
 
     const int head = blockIdx.x;
-    const size_t head_offset = (size_t)head * S * HEAD;
+    const int kv_head = head / (num_heads / num_kv_heads);   // GQA
+    const size_t q_off  = (size_t)head    * S * HEAD;
+    const size_t kv_off = (size_t)kv_head * S * HEAD;
 
     sdpa_prefill_kernel_bf16<Bc, HEAD>(
-        Q + head_offset, K + head_offset, V + head_offset,
-        O + head_offset,
+        Q + q_off, K + kv_off, V + kv_off,
+        O + q_off,
         rsqrt_d, S,
         Q_shared, K_shared, V_shared
     );
@@ -359,13 +367,17 @@ __host__ void sdpa_prefill_bf16(
     __nv_bfloat16* O,
     const int S,
     const int num_heads,
+    int num_kv_heads = -1,            // GQA：K/V 头数；-1 = MHA
     cudaStream_t stream = nullptr
 ) {
     if (S == 0 || num_heads == 0) return;
+    if (num_kv_heads <= 0) num_kv_heads = num_heads;
 
 #ifdef USE_CUDNN
     // cuDNN frontend FlashAttention（成功则返回；失败回退手写）。
-    if (sdpa_prefill_bf16_cudnn(Q, K, V, O, S, num_heads, HEAD, stream))
+    // 当前 cudnn 封装仅支持 MHA；GQA 暂走手写（后续可给 frontend 传 num_kv_heads）。
+    if (num_kv_heads == num_heads &&
+        sdpa_prefill_bf16_cudnn(Q, K, V, O, S, num_heads, HEAD, stream))
         return;
 #endif
 
@@ -376,7 +388,7 @@ __host__ void sdpa_prefill_bf16(
     const size_t smem_bytes = 3 * Bc * HEAD * sizeof(float);
 
     sdpa_prefill_launch_bf16<Bc, HEAD><<<grid, block, smem_bytes, stream>>>(
-        Q, K, V, O, rsqrt_d, S, num_heads
+        Q, K, V, O, rsqrt_d, S, num_heads, num_kv_heads
     );
 }
 

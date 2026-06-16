@@ -150,6 +150,48 @@ TEST_F(SDPAPrefillFP32Test, FullCausal) {
     free_tensor(d_Q); free_tensor(d_K); free_tensor(d_V); free_tensor(d_O);
 }
 
+// GQA：Hq 个 query head 共享 Hkv 个 KV head（kv_head = q_head / (Hq/Hkv)）
+TEST_F(SDPAPrefillFP32Test, GQACausal) {
+    const int S = 40, Hq = 4, Hkv = 2, head_dim = 128;
+    const int ratio = Hq / Hkv;
+    const int Nq = Hq * S * head_dim, Nkv = Hkv * S * head_dim;
+
+    auto Q_h = rand_vec(Nq);
+    auto Kkv = rand_vec(Nkv);    // K/V 仅 Hkv 头
+    auto Vkv = rand_vec(Nkv);
+
+    // 参考：把 KV 按组展开成 Hq 头再走 MHA 参考
+    std::vector<float> Kexp(Nq), Vexp(Nq);
+    for (int h = 0; h < Hq; ++h) {
+        int kvh = h / ratio;
+        std::copy(Kkv.begin()+ (size_t)kvh*S*head_dim, Kkv.begin()+ (size_t)(kvh+1)*S*head_dim,
+                  Kexp.begin()+ (size_t)h*S*head_dim);
+        std::copy(Vkv.begin()+ (size_t)kvh*S*head_dim, Vkv.begin()+ (size_t)(kvh+1)*S*head_dim,
+                  Vexp.begin()+ (size_t)h*S*head_dim);
+    }
+    std::vector<float> expected(Nq), out(Nq);
+    ref::sdpa_prefill_fp32(Q_h.data(), Kexp.data(), Vexp.data(), expected.data(), S, Hq, head_dim, true);
+
+    auto d_Q = allocate_tensor<float>(TensorShape::make_1d(Nq));
+    auto d_K = allocate_tensor<float>(TensorShape::make_1d(Nkv));
+    auto d_V = allocate_tensor<float>(TensorShape::make_1d(Nkv));
+    auto d_O = allocate_tensor_zeros<float>(TensorShape::make_1d(Nq));
+    copy_host_to_device(d_Q, Q_h.data());
+    copy_host_to_device(d_K, Kkv.data());
+    copy_host_to_device(d_V, Vkv.data());
+    cudaDeviceSynchronize();
+
+    sdpa_prefill_fp32(d_Q.data_, d_K.data_, d_V.data_, d_O.data_, S, Hq, Hkv);
+    cudaDeviceSynchronize();
+
+    copy_device_to_host(out.data(), d_O);
+    cudaDeviceSynchronize();
+    for (int i = 0; i < Nq; ++i)
+        EXPECT_NEAR(out[i], expected[i], 1e-4f) << " at index " << i;
+
+    free_tensor(d_Q); free_tensor(d_K); free_tensor(d_V); free_tensor(d_O);
+}
+
 // ===========================================================================
 // 4. BF16 正确性
 // ===========================================================================

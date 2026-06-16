@@ -61,6 +61,7 @@ __global__ void sdpa_decode_split_kernel(
     const int S_cache,
     const int total_S,
     const int num_heads,
+    const int num_kv_heads,
     const int nsplit,
     const float rsqrt_d,
     float* __restrict__ m_part,
@@ -87,7 +88,8 @@ __global__ void sdpa_decode_split_kernel(
     #pragma unroll
     for (int i = 0; i < DPL; ++i) q_reg[i] = dec_to_float<T>(Qh[lane * DPL + i]);
 
-    const size_t kv_base = (size_t)head * total_S * HEAD;
+    const int kv_head = head / (num_heads / num_kv_heads);   // GQA：组内 query 共享 kv
+    const size_t kv_base = (size_t)kv_head * total_S * HEAD;
     float m = -FLT_MAX, l = 0.f;
     float o[DPL];
     #pragma unroll
@@ -133,6 +135,7 @@ __global__ void sdpa_decode_combine_kernel(
     const float* __restrict__ l_part,
     const float* __restrict__ o_part,
     const int num_heads,
+    const int num_kv_heads,
     const int nsplit,
     const int S_cache,
     const int total_S
@@ -165,15 +168,20 @@ __global__ void sdpa_decode_combine_kernel(
     #pragma unroll
     for (int i = 0; i < DPL; ++i) Oh[lane * DPL + i] = dec_from_float<T>(acc[i] * inv);
 
-    // 追加新 KV 到 cache 末尾（位置 S_cache）
-    T* Kc = K_cache + (size_t)head * total_S * HEAD + (size_t)S_cache * HEAD;
-    T* Vc = V_cache + (size_t)head * total_S * HEAD + (size_t)S_cache * HEAD;
-    const T* Kn = K_new + (size_t)head * HEAD;
-    const T* Vn = V_new + (size_t)head * HEAD;
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) {
-        Kc[lane * DPL + i] = Kn[lane * DPL + i];
-        Vc[lane * DPL + i] = Vn[lane * DPL + i];
+    // 追加新 KV 到 cache 末尾（位置 S_cache）。GQA 下 cache/K_new 按 kv_head 索引，
+    // 同组多个 query head 共享一个 kv slot，故只让组首 query head 写一次。
+    const int ratio = num_heads / num_kv_heads;
+    if (head % ratio == 0) {
+        const int kv_head = head / ratio;
+        T* Kc = K_cache + (size_t)kv_head * total_S * HEAD + (size_t)S_cache * HEAD;
+        T* Vc = V_cache + (size_t)kv_head * total_S * HEAD + (size_t)S_cache * HEAD;
+        const T* Kn = K_new + (size_t)kv_head * HEAD;
+        const T* Vn = V_new + (size_t)kv_head * HEAD;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) {
+            Kc[lane * DPL + i] = Kn[lane * DPL + i];
+            Vc[lane * DPL + i] = Vn[lane * DPL + i];
+        }
     }
 }
 
@@ -219,9 +227,10 @@ template<typename T, int HEAD>
 inline void sdpa_decode_dispatch(
     const T* Q, T* K_cache, T* V_cache, T* O,
     const T* K_new, const T* V_new,
-    int S_cache, int total_S, int num_heads, cudaStream_t stream
+    int S_cache, int total_S, int num_heads, int num_kv_heads, cudaStream_t stream
 ) {
     if (num_heads == 0) return;
+    if (num_kv_heads <= 0) num_kv_heads = num_heads;
     const float rsqrt_d = 1.f / sqrtf((float)HEAD);
 
     // 每段约 128 个 KV 位置，nsplit 上限 64（铺满 GPU 又不过度切分）
@@ -237,12 +246,12 @@ inline void sdpa_decode_dispatch(
     const int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
 
     sdpa_decode_split_kernel<T, HEAD><<<blocks, warps_per_block * 32, 0, stream>>>(
-        Q, K_cache, V_cache, S_cache, total_S, num_heads, nsplit, rsqrt_d,
+        Q, K_cache, V_cache, S_cache, total_S, num_heads, num_kv_heads, nsplit, rsqrt_d,
         s.m, s.l, s.o
     );
     sdpa_decode_combine_kernel<T, HEAD><<<num_heads, 32, 0, stream>>>(
         O, K_cache, V_cache, K_new, V_new, s.m, s.l, s.o,
-        num_heads, nsplit, S_cache, total_S
+        num_heads, num_kv_heads, nsplit, S_cache, total_S
     );
 }
 
@@ -254,10 +263,12 @@ inline __host__ void sdpa_decode_fp32(
     const float* Q, float* K_cache, float* V_cache, float* O,
     const float* K_new, const float* V_new,
     const int S_cache, const int total_S, const int num_heads,
+    int num_kv_heads = -1,            // GQA：K/V 头数；-1 = MHA
     cudaStream_t stream = nullptr
 ) {
     sdpa_decode_dispatch<float, HEAD>(
-        Q, K_cache, V_cache, O, K_new, V_new, S_cache, total_S, num_heads, stream);
+        Q, K_cache, V_cache, O, K_new, V_new, S_cache, total_S, num_heads,
+        num_kv_heads, stream);
 }
 
 template<int HEAD = 128>
@@ -265,12 +276,14 @@ inline __host__ void sdpa_decode_bf16(
     const __nv_bfloat16* Q, __nv_bfloat16* K_cache, __nv_bfloat16* V_cache,
     __nv_bfloat16* O, const __nv_bfloat16* K_new, const __nv_bfloat16* V_new,
     const int S_cache, const int total_S, const int num_heads,
+    int num_kv_heads = -1,            // GQA：K/V 头数；-1 = MHA
     cudaStream_t stream = nullptr
 ) {
     // cuDNN 的 SDPA decode 需把 K_new/V_new 拼入 cache 再走 graph，且单 token
     // launch 开销大；此处用手写 split-K（已是 bandwidth-bound）。
     sdpa_decode_dispatch<__nv_bfloat16, HEAD>(
-        Q, K_cache, V_cache, O, K_new, V_new, S_cache, total_S, num_heads, stream);
+        Q, K_cache, V_cache, O, K_new, V_new, S_cache, total_S, num_heads,
+        num_kv_heads, stream);
 }
 
 }  // namespace nemotron::ops::attention
