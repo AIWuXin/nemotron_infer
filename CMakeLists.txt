@@ -129,6 +129,19 @@ if(USE_CUDNN)
 
     set(CUDNN_INCLUDE_DIRS ${cuDNN_INCLUDE_DIR})
     set(CUDNN_LIBRARIES cudnn)   # 链接主要的共享库目标（Windows 下为 cudnn）
+
+    # cudnn_frontend (header-only)：cuDNN 9.x 的 SDPA 只能走 graph API，
+    # 用 NVIDIA 官方 frontend 构图。仅 USE_CUDNN 时拉取，避免默认编译联网。
+    CPMAddPackage(
+            NAME cudnn_frontend
+            GITHUB_REPOSITORY NVIDIA/cudnn-frontend
+            VERSION 1.25.0
+            OPTIONS
+                "CUDNN_FRONTEND_BUILD_SAMPLES OFF"
+                "CUDNN_FRONTEND_BUILD_TESTS OFF"
+                "CUDNN_FRONTEND_BUILD_PYTHON_BINDINGS OFF"
+            EXCLUDE_FROM_ALL YES
+    )
 endif()
 
 
@@ -244,11 +257,21 @@ set_tests_properties(TestTensor PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
 
+# cuDNN frontend SDPA 实现为纯 host TU（.cpp），仅 USE_CUDNN 时编入。
+# 必须用 MSVC 编译：NVCC 处理 cudnn_frontend.h 的巨型 kernel 字面量会崩溃。
+set(CUDNN_HOST_SOURCES "")
+if (USE_CUDNN)
+    list(APPEND CUDNN_HOST_SOURCES
+            ${CMAKE_SOURCE_DIR}/nemotron_infer/csrc/include/ops/attention/sdpa_cudnn.cpp)
+    set_source_files_properties(${CUDNN_HOST_SOURCES} PROPERTIES LANGUAGE CXX)
+endif ()
+
 if (TEST_OPS)
     add_executable(
             TEST_OPS
             ${DIR_SOURCES}
             ${TEST_OPS}
+            ${CUDNN_HOST_SOURCES}
     )
     target_include_directories(TEST_OPS PRIVATE
             ${CMAKE_SOURCE_DIR}/nemotron_infer/csrc/include          # tensor.h, allocator.cuh
@@ -265,7 +288,7 @@ if (TEST_OPS)
             GTest::gmock
     )
     if (USE_CUDNN)
-        target_link_libraries(TEST_OPS ${CUDNN_LIBRARIES})
+        target_link_libraries(TEST_OPS ${CUDNN_LIBRARIES} cudnn_graph cudnn_frontend CUDA::nvrtc)
         target_include_directories(TEST_OPS PRIVATE ${CUDNN_INCLUDE_DIRS})
 
         target_compile_definitions(TEST_OPS PRIVATE USE_CUDNN)
