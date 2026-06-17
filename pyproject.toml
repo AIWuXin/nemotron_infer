@@ -10,8 +10,20 @@ dependencies = [
     "pybind11-stubgen<1",
 ]
 
-# 仅 dev：用于生成 HF 金标准 dump（tools/dump_mamba_block.py）。release 推理不需要。
+# dev：HF 金标准 dump + 整模型 Python 编排引擎（需 CUDA torch 提供 device 指针）。
 [dependency-groups]
 dev = [
     "torch>=2.0",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+    "rich>=13.0",
 ]
+
+# torch 从 PyTorch cu128 索引拉取（默认 PyPI 是 +cpu 轮子，GPU 编排不可用）。
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

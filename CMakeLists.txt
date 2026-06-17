@@ -180,12 +180,8 @@ set_target_properties(
         VERSION 0.1.0
 )
 
-if (USE_CUDNN)
-    target_link_libraries(nemotron_infer PRIVATE ${CUDNN_LIBRARIES})
-    target_include_directories(nemotron_infer PRIVATE ${CUDNN_INCLUDE_DIRS})
-
-    target_compile_definitions(nemotron_infer PRIVATE USE_CUDNN)
-endif ()
+# 推理模块不依赖 cuDNN：attention 是 GQA，恒走手写 FlashAttention（cuDNN 仅 MHA 生效）。
+# 故不为模块定义 USE_CUDNN，避免引用未链接的 sdpa_*_cudnn 符号 + 去掉 cudnn 运行时依赖。
 
 
 # ============================================

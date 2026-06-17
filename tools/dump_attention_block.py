@@ -24,7 +24,7 @@ HIDDEN = 256
 H_Q = 4
 H_KV = 2          # GQA group = H_Q/H_KV = 2
 HEAD = 128        # 必须 128（SDPA 核约束）
-S = 20
+S = 40            # >32：强制 SDPA prefill 走多 KV tile（覆盖跨 tile online-softmax 路径）
 B = 1
 EPS = 1e-5
 

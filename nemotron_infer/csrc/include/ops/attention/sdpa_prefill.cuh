@@ -292,10 +292,12 @@ __device__ __forceinline__ void sdpa_prefill_kernel_bf16(
         float exp_score = expf(score - m_new);
         float new_d = warp_reduce_sum(exp_score);
 
-        float rescale = d_prev * expf(m_prev - m_new);
+        // ⚠️ 只乘 expf(m_prev-m_new) 重缩放未归一化的 out=Σexp·V；切勿乘 d_prev
+        //   （多乘 d_prev 会在第 2 个及之后的 KV tile 上炸，单 tile S≤32 时 d_prev=0 掩盖）。
+        float correction = expf(m_prev - m_new);
         #pragma unroll
-        for (int k = 0; k < 4; k++) out[k] *= rescale;
-        d_prev = d_prev * expf(m_prev - m_new) + new_d;
+        for (int k = 0; k < 4; k++) out[k] *= correction;
+        d_prev = d_prev * correction + new_d;
         m_prev = m_new;
 
         #pragma unroll
