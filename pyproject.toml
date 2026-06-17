@@ -1,7 +1,7 @@
 [project]
 name = "nemotron-infer"
 version = "0.1.0"
-description = "Add your description here"
+description = "从零手写 CUDA 的 NVIDIA-Nemotron-3-Nano-4B-FP8 推理引擎（Mamba-2/Attention/MLP 混合架构，8GB 单卡）"
 readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = [

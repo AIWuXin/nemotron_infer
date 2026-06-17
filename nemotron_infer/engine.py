@@ -1,13 +1,25 @@
 """
-nemotron_runtime.py — Nemotron-H 整模型 Python 编排引擎（fp8 常驻 + bf16 exclude 层）。
+engine.py — Nemotron-H 整模型 Python 编排引擎（fp8 常驻 + bf16 exclude 层）。
 
-设计：权重常驻 GPU（fp8 矩阵保持 e4m3 + per-row scale，exclude 层 bf16，其余 fp32），
-Python 持有 hidden ping-pong / KV / conv / ssm 状态，逐层调 CUDA block（binding 模块）。
+整模型推理的"指挥层"：权重常驻 GPU，Python 持有 hidden ping-pong / KV / conv / ssm
+状态，逐层调用手写 CUDA block（`nemotron_infer.csrc.binding` pybind 模块），不依赖
+PyTorch 的算子，只借 torch 管理显存指针与采样。
 
-逐权重按存储 dtype 派发：F8_E4M3 → fp8 block；BF16 → bf16 block。层类型由权重存在性判定。
-每层调用前 reset_allocator()，block 瞬态 workspace 走全局 BumpAllocator。
+精度派发（按权重存储 dtype，加载期一次判定）：
+  - fp8 矩阵权重     → e4m3 + per-row scale，走 fp8 block（in/out_proj、q/k/v/o、up/down）
+  - exclude 层 / 嵌入 → bf16，走 bf16 block
+  - norm / conv / A_log / D / dt_bias → fp32
+层类型（mamba / attn / mlp）由权重命名存在性判定（in_proj→mamba，q_proj→attn，up_proj→mlp）。
 
-跑法：uv run python -m nemotron_infer.engine
+显存编排约定：
+  - 每层 forward/decode 前调 `B.reset_allocator()`（软回退，零 cudaMalloc/cudaFree），
+    block 瞬态 workspace 走全局 BumpAllocator，输出写到调用方持久 buffer（Python ping-pong）。
+  - decode 单 token 状态 O(1)：mamba 用 conv_state+ssm_state，attn 用增长的 KV cache。
+  - 采样在 GPU 上做（见 `_sample`/`_lm_head_last`），每 token 只回传 1 个 token id。
+
+公共 API：`prefill` / `decode_step` / `generate`（贪心）/ `stream_generate`（流式采样）。
+
+跑法：uv run --no-sync python -m nemotron_infer.engine   # 自测 + t/s
 """
 import os, sys, glob, time
 import torch
@@ -26,11 +38,31 @@ F32 = torch.float32
 
 
 def ptr(t):
+    """torch 张量 → 设备指针（uintptr），喂给 pybind block 的 data_ptr 参数。"""
     return t.data_ptr()
 
 
 class NemotronEngine:
+    """Nemotron-3-Nano-4B-FP8 单流推理引擎（权重 fp8 常驻，~5.5GB 显存，8GB 卡可跑）。
+
+    用法::
+
+        eng = NemotronEngine(max_tokens=16384)
+        # 一次性贪心生成
+        tokens, prefill_ms, dec_ms = eng.generate(prompt_ids, n_new=128)
+        # 流式采样（逐 token yield id，末尾 yield 计时 dict）
+        for tok in eng.stream_generate(prompt_ids, temperature=0.6, top_p=0.95):
+            ...
+
+    多轮对话每轮调一次 prefill→decode；新会话先 `reset_states()` 清 conv/ssm/KV。
+    """
+
     def __init__(self, model_dir=MODEL_DIR, max_tokens=2048):
+        """加载权重常驻 GPU + 预分配持久 buffer。
+
+        max_tokens：prefill 序列上限 + attn KV cache 容量。注意 KV cache 随该值线性
+        吃显存（4 个 attn 层 ≈ 16KB/token），256K 在 8GB 上放不下，实际上限 ~16-32K。
+        """
         self.max_tokens = max_tokens
         self.H = B.HIDDEN
         self._load(model_dir)
@@ -51,6 +83,7 @@ class NemotronEngine:
                 ly['vcache'] = torch.zeros(B.H_KV * self.max_tokens * B.HEAD, dtype=BF16, device=DEV)
 
     def reset_states(self):
+        """清零所有层的续接状态（conv/ssm/KV）。新会话或 /clear 前必调，否则带入上轮上下文。"""
         for ly in self.layers:
             if ly['type'] == 'mamba':
                 ly['conv_state'].zero_(); ly['ssm_state'].zero_()
@@ -59,6 +92,8 @@ class NemotronEngine:
 
     # -------------------------------------------------------------------
     def _load(self, md):
+        """从 *.safetensors 加载权重上 GPU：fp8 矩阵保 e4m3+per-row scale，其余按用途转
+        bf16/fp32。扫 backbone.layers.{i} 数层数，按权重名判层类型。加载后释放 CPU 副本。"""
         # 收集所有张量到 CPU，再按需转精度上 GPU
         raw = {}
         for fn in glob.glob(os.path.join(md, '*.safetensors')):
@@ -126,6 +161,7 @@ class NemotronEngine:
     # -------------------------------------------------------------------
     # ---- prefill runner（cap_states=True 时写续接状态）----
     def _run_mamba(self, ly, cur, out, S, cap_states=False):
+        """prefill 一个 mamba 层：cur[S,H]→out[S,H]。cap_states=True 写末态供 decode 续接。"""
         ip, op = ly['in_proj'], ly['out_proj']
         cs = ptr(ly['conv_state']) if cap_states else 0
         ss = ptr(ly['ssm_state']) if cap_states else 0
@@ -142,6 +178,7 @@ class NemotronEngine:
                 ptr(op[1]), ptr(out), 1, S, cs, ss)
 
     def _run_attn(self, ly, cur, out, S, cap_states=False):
+        """prefill 一个 attention 层（NoPE GQA）。cap_states=True 把 KV 写进 cache 供 decode。"""
         q, k, v, o = ly['q'], ly['k'], ly['v'], ly['o']
         kc = ptr(ly['kcache']) if cap_states else 0
         vc = ptr(ly['vcache']) if cap_states else 0
@@ -159,6 +196,7 @@ class NemotronEngine:
                 ptr(out), S, kc, vc, cap)
 
     def _run_mlp(self, ly, cur, out, S):
+        """MLP 层 up→relu²→down（无状态，prefill/decode 同一函数，decode 传 S=1 走 gemv 快路）。"""
         up, dn = ly['up'], ly['down']
         if up[0] == 'fp8':
             B.mlp_forward_fp8(
@@ -170,6 +208,7 @@ class NemotronEngine:
 
     # ---- decode runner（M=1，就地更新状态）----
     def _dec_mamba(self, ly, cur, out):
+        """decode 一个 mamba 层（M=1）：就地更新 conv_state/ssm_state，O(1) 不随长度增长。"""
         ip, op = ly['in_proj'], ly['out_proj']
         if ip[0] == 'fp8':
             B.mamba_decode_fp8(
@@ -184,6 +223,7 @@ class NemotronEngine:
                 ptr(op[1]), ptr(ly['conv_state']), ptr(ly['ssm_state']), ptr(out), 1)
 
     def _dec_attn(self, ly, cur, out, s_cache):
+        """decode 一个 attention 层（M=1）：新 token 的 KV 追加到 cache[s_cache]，再做因果注意力。"""
         q, k, v, o = ly['q'], ly['k'], ly['v'], ly['o']
         if q[0] == 'fp8':
             B.attn_decode_fp8(
@@ -212,7 +252,7 @@ class NemotronEngine:
         return self.logits[0].float()  # fp32 GPU，不搬 CPU
 
     def prefill(self, input_ids, cap_states=False):
-        """input_ids → 最后 token logits[VOCAB] (fp32 CPU)。cap_states=True 写续接状态供 decode。"""
+        """input_ids → 最后 token logits[VOCAB] (fp32 GPU)。cap_states=True 写续接状态供 decode。"""
         ids = torch.tensor(input_ids, dtype=torch.int64, device=DEV)
         S = ids.numel()
         assert S <= self.max_tokens
