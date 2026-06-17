@@ -120,6 +120,17 @@ public:
         total_allocated_     = 0;
     }
 
+    // ---- 软回退：复位偏移到起点但保留所有 slab（零 cudaMalloc/cudaFree）----
+    //   推理热路径每层调用：重放相同/更小的分配序列时全部命中已存在 slab。
+    //   ⚠️ 与 reset() 区别：reset() 真正 cudaFree（每次同步阻塞，是 decode 的真瓶颈），
+    //      rewind() 只挪指针，slab 常驻复用。
+    void rewind() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cur_idx_             = 0;
+        current_slab_offset_ = 0;
+        total_allocated_     = 0;
+    }
+
     // ---- 检查点：记录当前偏移 ----
     Mark mark() {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -115,7 +115,7 @@ def chat_once(eng, tk, messages, system, max_new=2048):
 def main():
     console.print("[dim]加载引擎中…[/dim]")
     t0 = time.time()
-    eng = NemotronEngine(max_tokens=4096)
+    eng = NemotronEngine(max_tokens=16384)
     tk = Tokenizer.from_file(os.path.join(MODEL_DIR, 'tokenizer.json'))
     console.print(f"[dim]就绪 ({time.time()-t0:.1f}s)[/dim]\n")
     banner(eng)

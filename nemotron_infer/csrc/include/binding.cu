@@ -55,7 +55,10 @@ static inline const fp8*   c8(uintptr_t p){ return reinterpret_cast<const fp8*>(
 // ===========================================================================
 // 基础 op
 // ===========================================================================
-static void reset_allocator() { default_allocator().reset(); }
+// 软回退：保留 slab 只挪偏移，避免每层 cudaFree/cudaMalloc 同步阻塞（decode 真瓶颈）。
+static void reset_allocator() { default_allocator().rewind(); }
+// 真正释放全部 slab（如需在大 prefill 后回收显存可显式调用）。
+static void free_allocator() { default_allocator().reset(); }
 static void sync() { cudaDeviceSynchronize(); }
 
 // embedding: ids[int64, num_tokens] → out[bf16, num_tokens, HIDDEN]
@@ -223,6 +226,7 @@ PYBIND11_MODULE(binding, m) {
     m.attr("IN_PROJ")  = cfg::H * cfg::P + (cfg::H * cfg::P + 2 * cfg::G * cfg::N) + cfg::H;
 
     m.def("reset_allocator", &reset_allocator);
+    m.def("free_allocator", &free_allocator);
     m.def("sync", &sync);
     m.def("embedding", &embedding);
     m.def("rmsnorm", &rmsnorm);

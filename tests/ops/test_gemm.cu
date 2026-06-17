@@ -10,6 +10,7 @@
 #include "tensor/tensor.h"
 #include "tensor/allocator.cuh"
 #include "ops/gemm.cuh"
+#include "ops/gemv.cuh"
 
 using namespace nemotron;
 using namespace nemotron::ops;
@@ -493,4 +494,153 @@ TEST_F(GemmThreeWayTest, MLP_UpProj_Speedup) {
     printf("  [Compare] GEMM MLP up_proj   FP32: %6.3f ms | BF16: %6.3f ms | FP8: %6.3f ms | Speedup(BF16): %.2f x | Speedup(FP8): %.2f x\n",
            fp32_ms, bf16_ms, fp8_ms, fp32_ms / bf16_ms, fp32_ms / fp8_ms);
     EXPECT_GT(fp8_ms, 0.0);
+}
+
+// ===========================================================================
+// 8. FP8 GEMV（M=1 decode 快路）正确性 + 对 gemm_fp8 提速
+// ===========================================================================
+namespace ref {
+
+// W8A16 参考：y[n] = (Σ_k float(W_fp8[n,k]) * float(x_bf16[k])) * w_scale[n]
+void gemv_fp8_ref(const __nv_bfloat16* x, const __nv_fp8_e4m3* W,
+                  const float* w_scale, float* y, int N, int K) {
+    for (int n = 0; n < N; ++n) {
+        float sum = 0.f;
+        for (int k = 0; k < K; ++k)
+            sum += static_cast<float>(W[n * K + k]) * __bfloat162float(x[k]);
+        y[n] = sum * w_scale[n];
+    }
+}
+
+// 权重 per-row(输出通道 N) 量化到 e4m3
+void quant_weight_perrow(const float* Wf, __nv_fp8_e4m3* Wq, float* w_scale, int N, int K) {
+    for (int n = 0; n < N; ++n) {
+        float row_max = 0.f;
+        for (int k = 0; k < K; ++k) row_max = std::max(row_max, std::fabs(Wf[n * K + k]));
+        w_scale[n] = row_max / 448.f;
+        if (w_scale[n] < 1e-10f) w_scale[n] = 1.f / 448.f;
+        float inv = 1.f / w_scale[n];
+        for (int k = 0; k < K; ++k) {
+            float q = Wf[n * K + k] * inv;
+            q = std::max(-448.f, std::min(448.f, q));
+            Wq[n * K + k] = static_cast<__nv_fp8_e4m3>(q);
+        }
+    }
+}
+
+}  // namespace ref
+
+class GemvFP8Test : public ::testing::Test {
+protected:
+    void SetUp() override { default_allocator().reset(); warmup_gpu(); }
+};
+
+TEST_F(GemvFP8Test, MatchesReference) {
+    // 真实 in_proj 归约维 K=HIDDEN=3136；N 取 64 行
+    const int N = 64, K = 3136;
+
+    std::vector<float> x_fp32(K), W_fp32(N * K);
+    for (int i = 0; i < K; ++i) x_fp32[i] = float((i * 13) % 17) * 0.1f - 0.8f;
+    for (size_t i = 0; i < W_fp32.size(); ++i) W_fp32[i] = float((i * 7) % 23) * 0.05f - 0.55f;
+
+    std::vector<__nv_bfloat16> x_bf16(K);
+    for (int i = 0; i < K; ++i) x_bf16[i] = __float2bfloat16_rn(x_fp32[i]);
+
+    std::vector<__nv_fp8_e4m3> W_fp8(N * K);
+    std::vector<float> w_scale(N);
+    ref::quant_weight_perrow(W_fp32.data(), W_fp8.data(), w_scale.data(), N, K);
+
+    std::vector<float> expected(N);
+    ref::gemv_fp8_ref(x_bf16.data(), W_fp8.data(), w_scale.data(), expected.data(), N, K);
+
+    auto d_x  = allocate_tensor<__nv_bfloat16>(TensorShape::make_1d(K));
+    auto d_W  = allocate_tensor<__nv_fp8_e4m3>(TensorShape::make_1d(N * K));
+    auto d_ws = allocate_tensor<float>(TensorShape::make_1d(N));
+    auto d_y  = allocate_tensor_zeros<__nv_bfloat16>(TensorShape::make_1d(N));
+    copy_host_to_device(d_x, x_bf16.data());
+    copy_host_to_device(d_W, W_fp8.data());
+    copy_host_to_device(d_ws, w_scale.data());
+    cudaDeviceSynchronize();
+
+    gemv_fp8(d_x.data_, d_W.data_, d_ws.data_, d_y.data_, N, K);
+    cudaDeviceSynchronize();
+
+    std::vector<__nv_bfloat16> out(N);
+    copy_device_to_host(out.data(), d_y);
+    cudaDeviceSynchronize();
+
+    for (int n = 0; n < N; ++n) {
+        float o = __bfloat162float(out[n]);
+        float tol = std::max(0.02f, 0.02f * std::fabs(expected[n]));
+        EXPECT_NEAR(o, expected[n], tol) << " at row " << n;
+    }
+
+    free_tensor(d_x); free_tensor(d_W); free_tensor(d_ws); free_tensor(d_y);
+}
+
+TEST_F(GemvFP8Test, ColdBandwidth) {
+    // 真实 MLP up_proj: N=12544, K=3136, M=1。冷缓存：轮转多块不同 W，
+    // 每次访问都未命中 L2（4060 L2=24MB，单块 W=39MB 已超），逼近真实 decode。
+    const int N = 12544, K = 3136;
+    const int POOL = 12;                       // 12 × 39MB ≈ 470MB
+    const size_t wbytes = (size_t)N * K;
+
+    std::vector<float> x_fp32(K), W_fp32(wbytes);
+    for (int i = 0; i < K; ++i) x_fp32[i] = float(i % 17) * 0.05f - 0.4f;
+    for (size_t i = 0; i < wbytes; ++i) W_fp32[i] = float(i % 23) * 0.02f - 0.22f;
+    std::vector<__nv_bfloat16> x_bf16(K);
+    for (int i = 0; i < K; ++i) x_bf16[i] = __float2bfloat16_rn(x_fp32[i]);
+    std::vector<__nv_fp8_e4m3> W_fp8(wbytes);
+    std::vector<float> w_scale(N);
+    ref::quant_weight_perrow(W_fp32.data(), W_fp8.data(), w_scale.data(), N, K);
+
+    auto d_x  = allocate_tensor<__nv_bfloat16>(TensorShape::make_1d(K));
+    auto d_ws = allocate_tensor<float>(TensorShape::make_1d(N));
+    auto d_y  = allocate_tensor_zeros<__nv_bfloat16>(TensorShape::make_1d(N));
+    copy_host_to_device(d_x, x_bf16.data());
+    copy_host_to_device(d_ws, w_scale.data());
+    std::vector<Tensor<__nv_fp8_e4m3>> pool(POOL);
+    for (int p = 0; p < POOL; ++p) {
+        pool[p] = allocate_tensor<__nv_fp8_e4m3>(TensorShape::make_1d(wbytes));
+        copy_host_to_device(pool[p], W_fp8.data());
+    }
+    cudaDeviceSynchronize();
+
+    int warmup = POOL, iters = 120;
+    // up: [N=12544, K=3136]
+    for (int i = 0; i < warmup; ++i)
+        gemv_fp8(d_x.data_, pool[i % POOL].data_, d_ws.data_, d_y.data_, N, K);
+    cudaDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i)
+        gemv_fp8(d_x.data_, pool[i % POOL].data_, d_ws.data_, d_y.data_, N, K);
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+    printf("  [Cold] gemv up   N=%d K=%d  %7.1f us | %.1f GB/s\n",
+           N, K, us, (double)wbytes / (us * 1e-6) / 1e9);
+
+    // down: [N=3136, K=12544]（同样 39MB，但归约维长、行少）
+    auto d_x2 = allocate_tensor<__nv_bfloat16>(TensorShape::make_1d(N));
+    auto d_y2 = allocate_tensor_zeros<__nv_bfloat16>(TensorShape::make_1d(K));
+    auto d_ws2 = allocate_tensor<float>(TensorShape::make_1d(K));
+    cudaMemset(d_x2.data_, 0, (size_t)N * 2);
+    cudaMemset(d_ws2.data_, 0, (size_t)K * 4);
+    cudaDeviceSynchronize();
+    for (int i = 0; i < warmup; ++i)
+        gemv_fp8(d_x2.data_, pool[i % POOL].data_, d_ws2.data_, d_y2.data_, K, N);
+    cudaDeviceSynchronize();
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i)
+        gemv_fp8(d_x2.data_, pool[i % POOL].data_, d_ws2.data_, d_y2.data_, K, N);
+    cudaDeviceSynchronize();
+    t1 = std::chrono::high_resolution_clock::now();
+    double us2 = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+    printf("  [Cold] gemv down N=%d K=%d  %7.1f us | %.1f GB/s\n",
+           K, N, us2, (double)wbytes / (us2 * 1e-6) / 1e9);
+    EXPECT_GT(us, 0.0);
+
+    for (int p = 0; p < POOL; ++p) free_tensor(pool[p]);
+    free_tensor(d_x); free_tensor(d_ws); free_tensor(d_y);
+    free_tensor(d_x2); free_tensor(d_y2); free_tensor(d_ws2);
 }

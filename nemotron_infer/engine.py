@@ -16,7 +16,7 @@ from safetensors import safe_open
 _HERE = os.path.dirname(os.path.abspath(__file__))
 os.add_dll_directory(r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin')
 sys.path.insert(0, os.path.join(_HERE, 'csrc'))
-import binding as B
+import nemotron_infer.csrc.binding as B
 
 MODEL_DIR = os.path.join(_HERE, '..', 'model', 'NVIDIA-Nemotron-3-Nano-4B-FP8')
 DEV = 'cuda'
@@ -199,14 +199,17 @@ class NemotronEngine:
 
     # -------------------------------------------------------------------
     def _lm_head_last(self, hbuf, S):
-        """对 hbuf 的最后一行做 final norm + lm_head，返回 logits[VOCAB] (fp32 CPU)。"""
+        """对 hbuf 的最后一行做 final norm + lm_head，返回 logits[VOCAB] (fp32 GPU)。
+        ⚠️ 留在 GPU：采样(softmax/sort/multinomial)在显卡上跑，只回传选中的 1 个 token id，
+           避免每 token 把 131072 词表搬到 CPU 再排序（实测 CPU nucleus 采样 ~18.8ms/tok，
+           几乎和整层 GPU 前向一样贵）。需 CPU 时调用方自行 .cpu()。"""
         B.reset_allocator()
         tmp = self.hbuf[1] if hbuf is self.hbuf[0] else self.hbuf[0]
         B.rmsnorm(ptr(hbuf), ptr(tmp), ptr(self.norm_f), S)
         last = tmp.data_ptr() + (S - 1) * self.H * 2  # bf16=2字节
         B.lm_head(last, ptr(self.lm_head), ptr(self.logits), 1)
         B.sync()
-        return self.logits[0].to(F32).cpu()
+        return self.logits[0].float()  # fp32 GPU，不搬 CPU
 
     def prefill(self, input_ids, cap_states=False):
         """input_ids → 最后 token logits[VOCAB] (fp32 CPU)。cap_states=True 写续接状态供 decode。"""
@@ -247,9 +250,10 @@ class NemotronEngine:
 
     @staticmethod
     def _sample(logits, temperature, top_p, recent_ids=None, rep_penalty=1.0):
-        """温度 + nucleus(top_p) 采样 + 重复惩罚；temperature<=0 退化为贪心。logits: fp32 [VOCAB]。"""
+        """温度 + nucleus(top_p) 采样 + 重复惩罚；temperature<=0 退化为贪心。
+        logits: fp32 GPU [VOCAB]——全部算子在 GPU 上跑，结尾只 int() 回传 1 个 token id。"""
         if rep_penalty != 1.0 and recent_ids:
-            idx = torch.tensor(sorted(set(recent_ids)), dtype=torch.long)
+            idx = torch.tensor(sorted(set(recent_ids)), dtype=torch.long, device=logits.device)
             v = logits[idx]
             logits[idx] = torch.where(v > 0, v / rep_penalty, v * rep_penalty)
         if temperature <= 0.0:

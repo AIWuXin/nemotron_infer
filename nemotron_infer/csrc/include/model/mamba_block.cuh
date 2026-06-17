@@ -26,6 +26,7 @@
 #include "tensor/tensor.h"
 #include "ops/reduce.cuh"
 #include "ops/gemm.cuh"
+#include "ops/gemv.cuh"
 #include "ops/elementwise.cuh"
 #include "ops/mamba2/causal_conv1d.cuh"
 #include "ops/mamba2/ssd_scan.cuh"
@@ -455,10 +456,8 @@ inline void mamba_block_decode_fp8(
     const int M = B;
     constexpr float EPS = 1e-5f;
     constexpr size_t BF = sizeof(bf16);
-    constexpr size_t WS_BYTES = 8ull * 1024 * 1024;   // cuBLASLt workspace（decode M=1，够用）
 
     auto normed   = allocate_tensor<bf16>(TensorShape::make_2d(M, HIDDEN));
-    auto norm_fp8 = allocate_tensor<fp8>(TensorShape::make_2d(M, HIDDEN));
     auto gate     = allocate_tensor<bf16>(TensorShape::make_2d(M, INTER));
     auto xbc      = allocate_tensor<bf16>(TensorShape::make_2d(M, CONV_DIM));
     auto dt       = allocate_tensor<bf16>(TensorShape::make_2d(M, H));
@@ -468,28 +467,18 @@ inline void mamba_block_decode_fp8(
     auto C_buf    = allocate_tensor<bf16>(TensorShape::make_2d(M, G * N));
     auto y_buf    = allocate_tensor<bf16>(TensorShape::make_2d(M, INTER));
     auto gnormed  = allocate_tensor<bf16>(TensorShape::make_2d(M, INTER));
-    auto gnorm_fp8= allocate_tensor<fp8>(TensorShape::make_2d(M, INTER));
     auto mixer    = allocate_tensor<bf16>(TensorShape::make_2d(M, HIDDEN));
-    auto xscale1  = allocate_tensor<float>(TensorShape::make_1d(1));
-    auto xscale2  = allocate_tensor<float>(TensorShape::make_1d(1));
-    auto amax     = allocate_tensor<unsigned int>(TensorShape::make_1d(1));
-    auto wsp      = allocate_tensor<char>(TensorShape::make_1d((int64_t)WS_BYTES));
 
     // 1. pre-norm RMSNorm
     rmsnorm_bf16(input, normed.data_, w.block_norm_w, M, HIDDEN, EPS, stream);
 
-    // 2. 量化 normed → fp8，3 个 in_proj 行切片复用同一激活
-    quantize_activation_fp8(normed.data_, norm_fp8.data_, xscale1.data_,
-                            amax.data_, (size_t)M * HIDDEN, stream);
-    gemm_fp8(norm_fp8.data_, w.in_proj_w,
-             gate.data_, xscale1.data_, w.in_proj_wscale,
-             M, INTER, HIDDEN, wsp.data_, WS_BYTES, stream);
-    gemm_fp8(norm_fp8.data_, w.in_proj_w + (size_t)INTER * HIDDEN,
-             xbc.data_, xscale1.data_, w.in_proj_wscale + INTER,
-             M, CONV_DIM, HIDDEN, wsp.data_, WS_BYTES, stream);
-    gemm_fp8(norm_fp8.data_, w.in_proj_w + (size_t)(INTER + CONV_DIM) * HIDDEN,
-             dt.data_, xscale1.data_, w.in_proj_wscale + (INTER + CONV_DIM),
-             M, H, HIDDEN, wsp.data_, WS_BYTES, stream);
+    // 2. in_proj：M=1 走自定义 fp8 gemv（激活保持 bf16，W8A16），3 个行切片各一发
+    gemv_fp8(normed.data_, w.in_proj_w,
+             w.in_proj_wscale, gate.data_, INTER, HIDDEN, stream);
+    gemv_fp8(normed.data_, w.in_proj_w + (size_t)INTER * HIDDEN,
+             w.in_proj_wscale + INTER, xbc.data_, CONV_DIM, HIDDEN, stream);
+    gemv_fp8(normed.data_, w.in_proj_w + (size_t)(INTER + CONV_DIM) * HIDDEN,
+             w.in_proj_wscale + (INTER + CONV_DIM), dt.data_, H, HIDDEN, stream);
 
     // 3. conv1d decode（更新 conv_state）
     causal_conv1d_decode_bf16<CONV_K>(xbc.data_, w.conv1d_w, w.conv1d_b,
@@ -515,12 +504,9 @@ inline void mamba_block_decode_fp8(
     rmsnorm_gated_bf16<G>(y_buf.data_, gnormed.data_, w.gnorm_w, gate.data_,
                           M, INTER, GROUP_SIZE, EPS, stream);
 
-    // 7. out_proj: 量化 gnormed → fp8，gemm_fp8
-    quantize_activation_fp8(gnormed.data_, gnorm_fp8.data_, xscale2.data_,
-                            amax.data_, (size_t)M * INTER, stream);
-    gemm_fp8(gnorm_fp8.data_, w.out_proj_w,
-             mixer.data_, xscale2.data_, w.out_proj_wscale,
-             M, HIDDEN, INTER, wsp.data_, WS_BYTES, stream);
+    // 7. out_proj: M=1 fp8 gemv
+    gemv_fp8(gnormed.data_, w.out_proj_w,
+             w.out_proj_wscale, mixer.data_, HIDDEN, INTER, stream);
 
     // 8. 残差
     elementwise_ops_bf16<kElementwiseAdd>(

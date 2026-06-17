@@ -30,6 +30,7 @@
 #include "tensor/tensor.h"
 #include "ops/reduce.cuh"
 #include "ops/gemm.cuh"
+#include "ops/gemv.cuh"
 #include "ops/elementwise.cuh"
 #include "ops/attention/sdpa_prefill.cuh"
 #include "ops/attention/sdpa_decode.cuh"
@@ -385,40 +386,27 @@ inline void attention_block_decode_fp8(
     constexpr int QD = H_Q * HEAD;
     constexpr int KD = H_KV * HEAD;
     constexpr float EPS = 1e-5f;
-    constexpr size_t WS_BYTES = 8ull * 1024 * 1024;
 
     auto normed   = allocate_tensor<bf16>(TensorShape::make_2d(1, HIDDEN));
-    auto norm_fp8 = allocate_tensor<fp8>(TensorShape::make_2d(1, HIDDEN));
     auto q        = allocate_tensor<bf16>(TensorShape::make_2d(1, QD));
     auto knew     = allocate_tensor<bf16>(TensorShape::make_2d(1, KD));
     auto vnew     = allocate_tensor<bf16>(TensorShape::make_2d(1, KD));
     auto ot       = allocate_tensor<bf16>(TensorShape::make_2d(1, QD));
-    auto o_fp8    = allocate_tensor<fp8>(TensorShape::make_2d(1, QD));
     auto attn     = allocate_tensor<bf16>(TensorShape::make_2d(1, HIDDEN));
-    auto xscale1  = allocate_tensor<float>(TensorShape::make_1d(1));
-    auto xscale2  = allocate_tensor<float>(TensorShape::make_1d(1));
-    auto amax     = allocate_tensor<unsigned int>(TensorShape::make_1d(1));
-    auto ws       = allocate_tensor<char>(TensorShape::make_1d((int64_t)WS_BYTES));
 
     rmsnorm_bf16(input, normed.data_, w.block_norm_w, 1, HIDDEN, EPS, stream);
 
-    quantize_activation_fp8(normed.data_, norm_fp8.data_, xscale1.data_,
-                            amax.data_, (size_t)HIDDEN, stream);
-    gemm_fp8(norm_fp8.data_, w.q_proj_w, q.data_,    xscale1.data_, w.q_proj_wscale,
-             1, QD, HIDDEN, ws.data_, WS_BYTES, stream);
-    gemm_fp8(norm_fp8.data_, w.k_proj_w, knew.data_, xscale1.data_, w.k_proj_wscale,
-             1, KD, HIDDEN, ws.data_, WS_BYTES, stream);
-    gemm_fp8(norm_fp8.data_, w.v_proj_w, vnew.data_, xscale1.data_, w.v_proj_wscale,
-             1, KD, HIDDEN, ws.data_, WS_BYTES, stream);
+    // q/k/v_proj: M=1 fp8 gemv（激活 bf16，W8A16）
+    gemv_fp8(normed.data_, w.q_proj_w, w.q_proj_wscale, q.data_,    QD, HIDDEN, stream);
+    gemv_fp8(normed.data_, w.k_proj_w, w.k_proj_wscale, knew.data_, KD, HIDDEN, stream);
+    gemv_fp8(normed.data_, w.v_proj_w, w.v_proj_wscale, vnew.data_, KD, HIDDEN, stream);
 
     sdpa_decode_bf16<HEAD>(
         q.data_, k_cache, v_cache, ot.data_, knew.data_, vnew.data_,
         S_cache, cache_cap, H_Q, H_KV, stream);
 
-    quantize_activation_fp8(ot.data_, o_fp8.data_, xscale2.data_,
-                            amax.data_, (size_t)QD, stream);
-    gemm_fp8(o_fp8.data_, w.o_proj_w, attn.data_, xscale2.data_, w.o_proj_wscale,
-             1, HIDDEN, QD, ws.data_, WS_BYTES, stream);
+    // o_proj: M=1 fp8 gemv
+    gemv_fp8(ot.data_, w.o_proj_w, w.o_proj_wscale, attn.data_, HIDDEN, QD, stream);
 
     elementwise_ops_bf16<kElementwiseAdd>(
         input, attn.data_, out, (size_t)HIDDEN,

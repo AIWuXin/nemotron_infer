@@ -20,7 +20,7 @@ eng = NemotronEngine()
 print(f'引擎加载 {time.time()-t0:.1f}s, 显存 {__import__("torch").cuda.memory_allocated()/1e9:.2f} GB')
 
 t0 = time.time()
-got = eng.prefill(ids).numpy()
+got = eng.prefill(ids).cpu().numpy()  # prefill 现返回 GPU 张量，比对前搬 CPU
 dt = time.time() - t0
 print(f'prefill {len(ids)} tok in {dt*1000:.1f}ms')
 

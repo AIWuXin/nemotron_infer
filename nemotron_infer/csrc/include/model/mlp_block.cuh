@@ -22,6 +22,7 @@
 #include "tensor/tensor.h"
 #include "ops/reduce.cuh"
 #include "ops/gemm.cuh"
+#include "ops/gemv.cuh"
 #include "ops/elementwise.cuh"
 
 namespace nemotron::model {
@@ -132,33 +133,42 @@ inline void mlp_block_forward_fp8(
     constexpr size_t WS_BYTES = 32ull * 1024 * 1024;
 
     auto normed   = allocate_tensor<bf16>(TensorShape::make_2d(M, HIDDEN));
-    auto norm_fp8 = allocate_tensor<fp8>(TensorShape::make_2d(M, HIDDEN));
     auto up       = allocate_tensor<bf16>(TensorShape::make_2d(M, INTER));
     auto act      = allocate_tensor<bf16>(TensorShape::make_2d(M, INTER));
-    auto act_fp8  = allocate_tensor<fp8>(TensorShape::make_2d(M, INTER));
     auto down     = allocate_tensor<bf16>(TensorShape::make_2d(M, HIDDEN));
-    auto xscale1  = allocate_tensor<float>(TensorShape::make_1d(1));
-    auto xscale2  = allocate_tensor<float>(TensorShape::make_1d(1));
-    auto amax     = allocate_tensor<unsigned int>(TensorShape::make_1d(1));
-    auto ws       = allocate_tensor<char>(TensorShape::make_1d((int64_t)WS_BYTES));
 
     rmsnorm_bf16(input, normed.data_, w.block_norm_w, M, HIDDEN, EPS, stream);
 
-    // up_proj: 量化 normed → fp8
-    quantize_activation_fp8(normed.data_, norm_fp8.data_, xscale1.data_,
-                            amax.data_, (size_t)M * HIDDEN, stream);
-    gemm_fp8(norm_fp8.data_, w.up_proj_w, up.data_, xscale1.data_, w.up_proj_wscale,
-             M, INTER, HIDDEN, ws.data_, WS_BYTES, stream);
+    if (M == 1) {
+        // decode 单 token：自定义 fp8 gemv（激活 bf16，W8A16），省 cuBLASLt 开销
+        gemv_fp8(normed.data_, w.up_proj_w, w.up_proj_wscale, up.data_, INTER, HIDDEN, stream);
+        elementwise_ops_bf16<kElementwiseRelu2>(
+            up.data_, up.data_, act.data_, (size_t)INTER,
+            1.f, nullptr, 0.f, 1.f, stream);
+        gemv_fp8(act.data_, w.down_proj_w, w.down_proj_wscale, down.data_, HIDDEN, INTER, stream);
+    } else {
+        // prefill：cuBLASLt 原生 fp8 matmul（M>1 高效）
+        auto norm_fp8 = allocate_tensor<fp8>(TensorShape::make_2d(M, HIDDEN));
+        auto act_fp8  = allocate_tensor<fp8>(TensorShape::make_2d(M, INTER));
+        auto xscale1  = allocate_tensor<float>(TensorShape::make_1d(1));
+        auto xscale2  = allocate_tensor<float>(TensorShape::make_1d(1));
+        auto amax     = allocate_tensor<unsigned int>(TensorShape::make_1d(1));
+        auto ws       = allocate_tensor<char>(TensorShape::make_1d((int64_t)WS_BYTES));
 
-    elementwise_ops_bf16<kElementwiseRelu2>(
-        up.data_, up.data_, act.data_, (size_t)M * INTER,
-        1.f, nullptr, 0.f, 1.f, stream);
+        quantize_activation_fp8(normed.data_, norm_fp8.data_, xscale1.data_,
+                                amax.data_, (size_t)M * HIDDEN, stream);
+        gemm_fp8(norm_fp8.data_, w.up_proj_w, up.data_, xscale1.data_, w.up_proj_wscale,
+                 M, INTER, HIDDEN, ws.data_, WS_BYTES, stream);
 
-    // down_proj: 量化 act → fp8
-    quantize_activation_fp8(act.data_, act_fp8.data_, xscale2.data_,
-                            amax.data_, (size_t)M * INTER, stream);
-    gemm_fp8(act_fp8.data_, w.down_proj_w, down.data_, xscale2.data_, w.down_proj_wscale,
-             M, HIDDEN, INTER, ws.data_, WS_BYTES, stream);
+        elementwise_ops_bf16<kElementwiseRelu2>(
+            up.data_, up.data_, act.data_, (size_t)M * INTER,
+            1.f, nullptr, 0.f, 1.f, stream);
+
+        quantize_activation_fp8(act.data_, act_fp8.data_, xscale2.data_,
+                                amax.data_, (size_t)M * INTER, stream);
+        gemm_fp8(act_fp8.data_, w.down_proj_w, down.data_, xscale2.data_, w.down_proj_wscale,
+                 M, HIDDEN, INTER, ws.data_, WS_BYTES, stream);
+    }
 
     elementwise_ops_bf16<kElementwiseAdd>(
         input, down.data_, out, (size_t)M * HIDDEN,

@@ -9,6 +9,7 @@
 #include <string>
 #include <cstdlib>
 #include <cmath>
+#include <chrono>
 #include <algorithm>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -181,4 +182,87 @@ TEST_F(MLPBlockTest, FP8_MatchHF) {
     double rel = std::sqrt(sse / std::max(ssr, 1e-12));
     printf("  [MLPBlock-fp8]  max_abs_err = %.3e  rel_l2 = %.3e\n", max_err, rel);
     EXPECT_LT(rel, 0.3);
+}
+
+// 真实维度 M=1 decode 速度：隔离 mlp_block_forward_fp8（无 Python/pybind）。
+// 权重用 raw cudaMalloc 持久化；mlp 内部缓冲走默认分配器，每轮 reset。
+TEST_F(MLPBlockTest, RealDimDecodeSpeed) {
+    constexpr int H = 3136, I = 12544;
+    auto mkfp8 = [](int Nrows, int K) {
+        std::vector<float> wf((size_t)Nrows * K);
+        for (size_t i = 0; i < wf.size(); ++i) wf[i] = float(i % 23) * 0.02f - 0.22f;
+        std::vector<__nv_fp8_e4m3> wq(wf.size());
+        std::vector<float> sc(Nrows);
+        for (int n = 0; n < Nrows; ++n) {
+            float rmax = 0.f;
+            for (int k = 0; k < K; ++k) rmax = std::max(rmax, std::abs(wf[(size_t)n * K + k]));
+            float s = rmax / 448.f; if (s < 1e-10f) s = 1.f / 448.f;
+            sc[n] = s; float inv = 1.f / s;
+            for (int k = 0; k < K; ++k) {
+                float q = std::max(-448.f, std::min(448.f, wf[(size_t)n * K + k] * inv));
+                wq[(size_t)n * K + k] = static_cast<__nv_fp8_e4m3>(q);
+            }
+        }
+        __nv_fp8_e4m3* dw; float* ds;
+        cudaMalloc(&dw, wq.size()); cudaMalloc(&ds, (size_t)Nrows * 4);
+        cudaMemcpy(dw, wq.data(), wq.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(ds, sc.data(), (size_t)Nrows * 4, cudaMemcpyHostToDevice);
+        return std::pair<__nv_fp8_e4m3*, float*>{dw, ds};
+    };
+    auto upw = mkfp8(I, H);
+    auto dnw = mkfp8(H, I);
+    float* dnorm; cudaMalloc(&dnorm, (size_t)H * 4);
+    cudaMemset(dnorm, 0, (size_t)H * 4);
+    __nv_bfloat16 *din, *dout;
+    cudaMalloc(&din, (size_t)H * 2); cudaMalloc(&dout, (size_t)H * 2);
+    cudaMemset(din, 0, (size_t)H * 2);
+    cudaDeviceSynchronize();
+
+    MLPBlockWeightsFP8 w{ dnorm, upw.first, upw.second, dnw.first, dnw.second };
+    // 生产路径用 rewind（软回退，零 cudaMalloc/cudaFree）；若改回 reset() 会慢 ~6x
+    auto run = [&]{ default_allocator().rewind();
+                    mlp_block_forward_fp8<H, I>(din, w, dout, 1); };
+
+    for (int i = 0; i < 20; ++i) run();
+    cudaDeviceSynchronize();
+    int iters = 200;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iters; ++i) run();
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+    printf("  [MLP M=1 C++]  %.1f us/call  (2 gemv 39MB each, hot)\n", us);
+
+    // 逐 op 拆解：分别只跑 2 个 gemv / 只跑 rmsnorm / 只跑 relu2
+    __nv_bfloat16 *normed, *upbuf, *actbuf;
+    cudaMalloc(&normed, (size_t)H * 2);
+    cudaMalloc(&upbuf, (size_t)I * 2);
+    cudaMalloc(&actbuf, (size_t)I * 2);
+    cudaMemset(normed, 0, (size_t)H * 2);
+    cudaMemset(upbuf, 0, (size_t)I * 2);
+    cudaDeviceSynchronize();
+    auto timeit = [&](const char* name, auto fn){
+        for (int i = 0; i < 20; ++i) fn();
+        cudaDeviceSynchronize();
+        auto a = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < iters; ++i) fn();
+        cudaDeviceSynchronize();
+        auto b = std::chrono::high_resolution_clock::now();
+        printf("    %-14s %.1f us\n", name,
+               std::chrono::duration<double, std::micro>(b - a).count() / iters);
+    };
+    using namespace nemotron::ops;
+    timeit("gemv_up", [&]{ gemv_fp8(normed, upw.first, upw.second, upbuf, I, H); });
+    timeit("gemv_down", [&]{ gemv_fp8(actbuf, dnw.first, dnw.second, normed, H, I); });
+    timeit("rmsnorm", [&]{ rmsnorm_bf16(din, normed, dnorm, 1, H, 1e-5f, nullptr); });
+    timeit("relu2", [&]{ elementwise_ops_bf16<kElementwiseRelu2>(
+                upbuf, upbuf, actbuf, (size_t)I, 1.f, nullptr, 0.f, 1.f, nullptr); });
+    timeit("residual", [&]{ elementwise_ops_bf16<kElementwiseAdd>(
+                din, normed, dout, (size_t)H, 1.f, nullptr, 0.f, 1.f, nullptr); });
+    cudaFree(normed); cudaFree(upbuf); cudaFree(actbuf);
+    EXPECT_GT(us, 0.0);
+
+    cudaFree(upw.first); cudaFree(upw.second);
+    cudaFree(dnw.first); cudaFree(dnw.second);
+    cudaFree(dnorm); cudaFree(din); cudaFree(dout);
 }
