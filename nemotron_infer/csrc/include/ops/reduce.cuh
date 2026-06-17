@@ -95,7 +95,8 @@ namespace nemotron::ops {
     // ===========================================================================
     // __global__ launch kernel
     // ===========================================================================
-    __global__ void rmsnorm_launch_fp32(
+    // static：非模板 __global__，header 多 TU 包含时给 TU-local 链接（避免 nvlink multiple def）
+    static __global__ void rmsnorm_launch_fp32(
         const float* __restrict__ x,
         float* __restrict__ y,
         const float* __restrict__ w,
@@ -214,7 +215,7 @@ namespace nemotron::ops {
         }
     }
 
-    __global__ void rmsnorm_launch_bf16(
+    static __global__ void rmsnorm_launch_bf16(
         const __nv_bfloat16* __restrict__ x,
         __nv_bfloat16* __restrict__ y,
         const float* __restrict__ w,
@@ -292,6 +293,14 @@ namespace nemotron::ops {
             vals[g] = s[0][g];
     }
 
+    // SiLU 标量：silu(z) = z * sigmoid(z) = z / (1+exp(-z))
+    __device__ __forceinline__ float silu_scalar(float z) { return z / (1.f + expf(-z)); }
+
+    // 门控 RMSNorm — 对齐 HF MambaRMSNormGated(norm_before_gate=False)：
+    //   gated = x * silu(gate)
+    //   rstd[g] = rsqrt(mean_over_group(gated^2) + eps)
+    //   y = gated * rstd[group] * w
+    // 注意：RMS 作用在 x*silu(gate) 上、gate 先过 SiLU（不是对 x 求 RMS、不是乘原值 gate）。
     template<int Group>
     __device__ __forceinline__ void rmsnorm_gated_kernel_fp32(
         const float* __restrict__ x,
@@ -308,11 +317,11 @@ namespace nemotron::ops {
             const float* g_row = gate + row * cols;
             float* y_row = y + row * cols;
 
-            // Step 1: Group 组各自求 sq_sum
+            // Step 1: 各 Group 求 gated=x*silu(gate) 的平方和
             float sq_sum[Group] = {0.f};
             for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
-                float val = x_row[col];
-                sq_sum[col / group_size] += val * val;
+                float gated = x_row[col] * silu_scalar(g_row[col]);
+                sq_sum[col / group_size] += gated * gated;
             }
 
             // Step 2: block 级组规约
@@ -324,10 +333,10 @@ namespace nemotron::ops {
             for (int g = 0; g < Group; ++g)
                 scale[g] = rsqrtf(sq_sum[g] / static_cast<float>(group_size) + eps);
 
-            // Step 4: 写输出: y = x * rms * w * gate
+            // Step 4: 写输出: y = gated * rstd * w
             for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
-                float val = x_row[col];
-                y_row[col] = val * scale[col / group_size] * w[col] * g_row[col];
+                float gated = x_row[col] * silu_scalar(g_row[col]);
+                y_row[col] = gated * scale[col / group_size] * w[col];
             }
 
             __syncthreads();
@@ -392,18 +401,23 @@ namespace nemotron::ops {
             const float4* g_row = g_vec + row * vec_size;
             float4* y_row = y_vec + row * vec_size;
 
-            // Step 1: 向量化 load + 拆包算 x²（每个 float4 装 8 个 BF16）
+            // Step 1: 向量化 load x + gate，算 gated=x*silu(gate) 的平方和
             float sq_sum[Group] = {0.f};
             for (size_t col_v = threadIdx.x; col_v < vec_size; col_v += blockDim.x) {
                 const float4 in_val = x_row[col_v];
-                const auto& bf_x = reinterpret_cast<const __nv_bfloat162&>(in_val.x);
-                const auto& bf_y = reinterpret_cast<const __nv_bfloat162&>(in_val.y);
-                const auto& bf_z = reinterpret_cast<const __nv_bfloat162&>(in_val.z);
-                const auto& bf_w = reinterpret_cast<const __nv_bfloat162&>(in_val.w);
-                float2 f_x = __bfloat1622float2(bf_x);
-                float2 f_y = __bfloat1622float2(bf_y);
-                float2 f_z = __bfloat1622float2(bf_z);
-                float2 f_w = __bfloat1622float2(bf_w);
+                const float4 gate_val = g_row[col_v];
+                float2 f_x = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(in_val.x));
+                float2 f_y = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(in_val.y));
+                float2 f_z = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(in_val.z));
+                float2 f_w = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(in_val.w));
+                float2 gf_x = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(gate_val.x));
+                float2 gf_y = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(gate_val.y));
+                float2 gf_z = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(gate_val.z));
+                float2 gf_w = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(gate_val.w));
+                f_x.x *= silu_scalar(gf_x.x); f_x.y *= silu_scalar(gf_x.y);
+                f_y.x *= silu_scalar(gf_y.x); f_y.y *= silu_scalar(gf_y.y);
+                f_z.x *= silu_scalar(gf_z.x); f_z.y *= silu_scalar(gf_z.y);
+                f_w.x *= silu_scalar(gf_w.x); f_w.y *= silu_scalar(gf_w.y);
 
                 size_t base = col_v * 8;
                 sq_sum[base / group_size] += f_x.x * f_x.x;
@@ -450,14 +464,15 @@ namespace nemotron::ops {
 
                 const float* w_col = w + col_v * 8;
                 size_t base = col_v * 8;
-                f_x.x *= scale[base / group_size] * w_col[0] * gf_x.x;
-                f_x.y *= scale[(base + 1) / group_size] * w_col[1] * gf_x.y;
-                f_y.x *= scale[(base + 2) / group_size] * w_col[2] * gf_y.x;
-                f_y.y *= scale[(base + 3) / group_size] * w_col[3] * gf_y.y;
-                f_z.x *= scale[(base + 4) / group_size] * w_col[4] * gf_z.x;
-                f_z.y *= scale[(base + 5) / group_size] * w_col[5] * gf_z.y;
-                f_w.x *= scale[(base + 6) / group_size] * w_col[6] * gf_w.x;
-                f_w.y *= scale[(base + 7) / group_size] * w_col[7] * gf_w.y;
+                // gated = x*silu(gate)，再 *rstd*w（gate 已含 SiLU，不再乘原值）
+                f_x.x = f_x.x * silu_scalar(gf_x.x) * scale[base / group_size] * w_col[0];
+                f_x.y = f_x.y * silu_scalar(gf_x.y) * scale[(base + 1) / group_size] * w_col[1];
+                f_y.x = f_y.x * silu_scalar(gf_y.x) * scale[(base + 2) / group_size] * w_col[2];
+                f_y.y = f_y.y * silu_scalar(gf_y.y) * scale[(base + 3) / group_size] * w_col[3];
+                f_z.x = f_z.x * silu_scalar(gf_z.x) * scale[(base + 4) / group_size] * w_col[4];
+                f_z.y = f_z.y * silu_scalar(gf_z.y) * scale[(base + 5) / group_size] * w_col[5];
+                f_w.x = f_w.x * silu_scalar(gf_w.x) * scale[(base + 6) / group_size] * w_col[6];
+                f_w.y = f_w.y * silu_scalar(gf_w.y) * scale[(base + 7) / group_size] * w_col[7];
 
                 __nv_bfloat162 out_x = __float22bfloat162_rn(f_x);
                 __nv_bfloat162 out_y = __float22bfloat162_rn(f_y);

@@ -25,6 +25,7 @@
 #ifndef NEMOTRON_INFER_MAMBA2_SSD_SCAN_CUH
 #define NEMOTRON_INFER_MAMBA2_SSD_SCAN_CUH
 
+#include <cuda_bf16.h>
 #include <cfloat>
 #include <cmath>
 
@@ -35,17 +36,24 @@ __device__ __forceinline__ float ssd_softplus_clamp(float v, float dt_min, float
     return fminf(dt_max, fmaxf(dt_min, sp));
 }
 
-template<int H, int D, int N, int WARPS = 4>
-__global__ void ssd_scan_prefill_launch_fp32(
-    const float* __restrict__ x,        // [B,S,H,D]
-    const float* __restrict__ dt,       // [B,S,H]
+// I/O dtype 适配：x/dt/B/C/y 可为 fp32 或 bf16；state/A_log/D/dt_bias 与累加恒 fp32
+// （精度表红线：scan 计算必须 fp32。bf16 仅作 IO，读 bf16→fp32 累加→写 bf16）。
+__device__ __forceinline__ float scan_to_f(float v)         { return v; }
+__device__ __forceinline__ float scan_to_f(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ void  scan_store(float* p, float v)         { *p = v; }
+__device__ __forceinline__ void  scan_store(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+
+template<typename IoT, int H, int D, int N, int WARPS = 4>
+__global__ void ssd_scan_prefill_launch(
+    const IoT* __restrict__ x,          // [B,S,H,D]
+    const IoT* __restrict__ dt,         // [B,S,H]
     const float* __restrict__ A_log,    // [H]
-    const float* __restrict__ B,        // [B,S,G,N]
-    const float* __restrict__ C,        // [B,S,G,N]
+    const IoT* __restrict__ B,          // [B,S,G,N]
+    const IoT* __restrict__ C,          // [B,S,G,N]
     const float* __restrict__ D_param,  // [H]
     const float* __restrict__ dt_bias,  // [H] optional
-    float* __restrict__ y,              // [B,S,H,D]
-    float* __restrict__ ssm_state_out,  // [B,H,D,N] optional
+    IoT* __restrict__ y,                // [B,S,H,D]
+    float* __restrict__ ssm_state_out,  // [B,H,D,N] optional (恒 fp32)
     const int batch, const int S, const int n_groups,
     const float dt_min, const float dt_max
 ) {
@@ -79,16 +87,16 @@ __global__ void ssd_scan_prefill_launch_fp32(
         // B/C[t]（按 group）载入 shared，供本 head 全部 pos 复用
         const size_t bc_base = ((size_t)(b_idx * S + t) * n_groups + group) * N;
         for (int i = tid; i < N; i += blockThreads) {
-            sB[i] = B[bc_base + i];
-            sC[i] = C[bc_base + i];
+            sB[i] = scan_to_f(B[bc_base + i]);
+            sC[i] = scan_to_f(C[bc_base + i]);
         }
         __syncthreads();
 
         if (active) {
             const float dt_v = ssd_softplus_clamp(
-                dt[(size_t)(b_idx * S + t) * H + h] + bias_h, dt_min, dt_max);
+                scan_to_f(dt[(size_t)(b_idx * S + t) * H + h]) + bias_h, dt_min, dt_max);
             const float dA = expf(A_h * dt_v);
-            const float x_val = x[((size_t)(b_idx * S + t) * H + h) * D + pos];
+            const float x_val = scan_to_f(x[((size_t)(b_idx * S + t) * H + h) * D + pos]);
 
             float y_part = 0.f;
             #pragma unroll
@@ -104,7 +112,7 @@ __global__ void ssd_scan_prefill_launch_fp32(
                 y_part += __shfl_down_sync(0xffffffff, y_part, off);
 
             if (lane == 0)
-                y[((size_t)(b_idx * S + t) * H + h) * D + pos] = y_part + Dh * x_val;
+                scan_store(&y[((size_t)(b_idx * S + t) * H + h) * D + pos], y_part + Dh * x_val);
         }
         __syncthreads();   // 下一步覆盖 shared 前同步（idle warp 也必须到达）
     }
@@ -120,7 +128,7 @@ __global__ void ssd_scan_prefill_launch_fp32(
 }
 
 // ===========================================================================
-// __host__ wrapper
+// __host__ wrappers — fp32 与 bf16 共用同一份模板 kernel（内部恒 fp32 计算）
 // ===========================================================================
 template<int H, int D, int N, int WARPS = 4>
 __host__ void ssd_scan_prefill_fp32(
@@ -133,7 +141,24 @@ __host__ void ssd_scan_prefill_fp32(
 ) {
     dim3 block(32, WARPS);
     dim3 grid(batch * H, (D + WARPS - 1) / WARPS);
-    ssd_scan_prefill_launch_fp32<H, D, N, WARPS><<<grid, block, 0, stream>>>(
+    ssd_scan_prefill_launch<float, H, D, N, WARPS><<<grid, block, 0, stream>>>(
+        x, dt, A_log, B, C, D_param, dt_bias, y, ssm_state_out,
+        batch, S, n_groups, dt_min, dt_max);
+}
+
+// bf16 IO 路径：x/dt/B/C/y 为 bf16；A_log/D/dt_bias/state 仍 fp32（红线）。
+template<int H, int D, int N, int WARPS = 4>
+__host__ void ssd_scan_prefill_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* dt, const float* A_log,
+    const __nv_bfloat16* B, const __nv_bfloat16* C, const float* D_param, const float* dt_bias,
+    __nv_bfloat16* y, float* ssm_state_out,
+    int batch, int S, int n_groups,
+    float dt_min = 0.f, float dt_max = FLT_MAX,
+    cudaStream_t stream = nullptr
+) {
+    dim3 block(32, WARPS);
+    dim3 grid(batch * H, (D + WARPS - 1) / WARPS);
+    ssd_scan_prefill_launch<__nv_bfloat16, H, D, N, WARPS><<<grid, block, 0, stream>>>(
         x, dt, A_log, B, C, D_param, dt_bias, y, ssm_state_out,
         batch, S, n_groups, dt_min, dt_max);
 }

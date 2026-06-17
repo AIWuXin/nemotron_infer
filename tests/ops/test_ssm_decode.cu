@@ -20,8 +20,8 @@ void ssm_step_fp32(float x, float dt, float A_log, float D,
                    float* state, float& y, int N) {
     float s = (dt > 20.f) ? dt : (dt < -20.f) ? 0.f : std::log(1.f + std::exp(dt));
     dt = s;   // 本模型 dt_limit=(0,inf)：只 softplus 不截断（与 kernel 默认 (0,FLT_MAX) 一致）
-    float A = -std::exp(A_log) * dt;
-    float dA = std::exp(dt * A);
+    float A = -std::exp(A_log);          // A=-exp(A_log)，不预乘 dt
+    float dA = std::exp(dt * A);          // dA=exp(dt·A)=exp(-exp(A_log)·dt)，线性于 dt（对齐 prefill/HF）
 
     float y_dot = 0.f;
     for (int n = 0; n < N; ++n) {

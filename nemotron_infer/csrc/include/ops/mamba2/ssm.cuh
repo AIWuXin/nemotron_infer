@@ -76,7 +76,9 @@ __device__ __forceinline__ void ssm_decode_dev(
     if (dt_bias) dt_v += dt_bias[h];
     const float sp = (dt_v > 20.f) ? dt_v : (dt_v < -20.f) ? 0.f : logf(1.f + expf(dt_v));
     dt_v = fminf(dt_max, fmaxf(dt_min, sp));
-    const float dA = expf(dt_v * (-expf(A_log[h]) * dt_v));   // 衰减因子
+    // 衰减因子 dA = exp(dt·A)，A=-exp(A_log)（A 不预乘 dt）→ exp(-exp(A_log)·dt)，线性于 dt。
+    // 与 SSD scan prefill（已对齐 HF 1e-6）一致，衔接同一条 state。
+    const float dA = expf(-expf(A_log[h]) * dt_v);
     const float Dh = D_param[h];
 
     const size_t head_base = (size_t)b_idx * H * D * N + (size_t)h * D * N;

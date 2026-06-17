@@ -60,6 +60,11 @@ public:
     static constexpr size_t DEFAULT_SLAB_SIZE = 64ULL * 1024 * 1024; // 64 MB
     static constexpr size_t ALIGNMENT         = 128;
 
+    // 偏移检查点：mark() 记录当前位置，reset_to() 回退到该位置但保留所有 slab。
+    // 用于复用临时 workspace（推理热路径/基准）：分配后 mark，每次前向后 reset_to，
+    // 重放相同分配序列命中已存在的 slab，避免重复 cudaMalloc/cudaFree。
+    struct Mark { size_t slab_idx; size_t offset; size_t total; };
+
     explicit BumpAllocator(size_t slab_size = DEFAULT_SLAB_SIZE)
         : slab_size_(slab_size) {}
 
@@ -74,12 +79,20 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         size_t aligned = align_up(size_bytes, ALIGNMENT);
 
-        // 当前 slab 剩余不足 → 分配新 slab
-        if (!current_slab_ || (current_slab_offset_ + aligned > current_slab_size_)) {
-            allocate_new_slab(aligned);
+        const bool need_new = slabs_.empty() ||
+            (current_slab_offset_ + aligned > slabs_[cur_idx_].size);
+        if (need_new) {
+            // 优先复用下一个已存在 slab（rewind 后重放分配序列时命中，零 cudaMalloc）
+            if (!slabs_.empty() && cur_idx_ + 1 < slabs_.size() &&
+                aligned <= slabs_[cur_idx_ + 1].size) {
+                cur_idx_++;
+                current_slab_offset_ = 0;
+            } else {
+                allocate_new_slab(aligned);
+            }
         }
 
-        void* ptr = static_cast<char*>(current_slab_) + current_slab_offset_;
+        void* ptr = static_cast<char*>(slabs_[cur_idx_].ptr) + current_slab_offset_;
         current_slab_offset_ += aligned;
         total_allocated_ += aligned;
         return ptr;
@@ -98,20 +111,35 @@ public:
     // ---- 释放所有 slab（不逐块释放，效率最高）----
     void reset() {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto* slab : slabs_) {
-            cudaFree(slab);
+        for (auto& slab : slabs_) {
+            cudaFree(slab.ptr);
         }
         slabs_.clear();
-        current_slab_        = nullptr;
-        current_slab_size_   = 0;
+        cur_idx_             = 0;
         current_slab_offset_ = 0;
         total_allocated_     = 0;
+    }
+
+    // ---- 检查点：记录当前偏移 ----
+    Mark mark() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return Mark{cur_idx_, current_slab_offset_, total_allocated_};
+    }
+
+    // ---- 回退到检查点（保留 slab，仅复位偏移）----
+    void reset_to(const Mark& m) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cur_idx_             = m.slab_idx;
+        current_slab_offset_ = m.offset;
+        total_allocated_     = m.total;
     }
 
     size_t total_allocated() const { return total_allocated_; }
     size_t num_slabs()       const { return slabs_.size(); }
 
 private:
+    struct Slab { void* ptr; size_t size; };
+
     void allocate_new_slab(size_t min_size = 0) {
         // 分配大块 GPU 内存，至少满足 min_size
         void* slab = nullptr;
@@ -122,16 +150,14 @@ private:
                     cudaGetErrorString(err));
             std::abort();
         }
-        slabs_.push_back(slab);
-        current_slab_        = slab;
-        current_slab_size_   = alloc_size;
+        slabs_.push_back(Slab{slab, alloc_size});
+        cur_idx_             = slabs_.size() - 1;
         current_slab_offset_ = 0;
     }
 
     size_t slab_size_;
-    std::vector<void*> slabs_;
-    void*   current_slab_        = nullptr;
-    size_t  current_slab_size_   = 0;
+    std::vector<Slab> slabs_;
+    size_t  cur_idx_             = 0;   // 当前 slab 在 slabs_ 中的下标
     size_t  current_slab_offset_ = 0;
     size_t  total_allocated_     = 0;
     std::mutex mutex_;

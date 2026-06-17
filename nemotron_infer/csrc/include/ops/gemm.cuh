@@ -110,6 +110,47 @@ inline void gemm_bf16(
 
 
 // ===========================================================================
+// Strided-batched TF32 GEMM（row-major 语义，供 chunked SSD scan 用）
+//   计算 row-major:  C[M,N] = opA(A) @ opB(B)
+//     A 存储 [M,K]（transA=false）或 [K,M]（transA=true）
+//     B 存储 [K,N]（transB=false）或 [N,K]（transB=true）
+//   fp32 IO、TF32 tensor core 累加 fp32。stride 以元素计（batch 间）。
+//
+//   实现：cuBLAS 列主序 → row-major C[M,N] = col-major Cᵀ[N,M]，交换 A/B 操作数。
+//   row-major[r,c] 视作 col-major[c,r]，leading dim = c（行主序的列数）。
+// ===========================================================================
+inline void gemm_strided_batched_tf32(
+    const float* A, const float* B, float* C,
+    int M, int N, int K,
+    bool transA, bool transB,
+    long long strideA, long long strideB, long long strideC,
+    int batch,
+    cudaStream_t stream = nullptr
+) {
+    const float alpha = 1.f, beta = 0.f;
+    cublasSetStream(cublas_handle(), stream);
+
+    const cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const int ldb = transB ? K : N;   // B 在 cublas 的第 1 操作数（列主序）
+    const int lda = transA ? M : K;   // A 在 cublas 的第 2 操作数
+
+    cublasGemmStridedBatchedEx(
+        cublas_handle(),
+        opB, opA,
+        N, M, K,
+        &alpha,
+        B, CUDA_R_32F, ldb, strideB,
+        A, CUDA_R_32F, lda, strideA,
+        &beta,
+        C, CUDA_R_32F, N, strideC,
+        batch,
+        CUBLAS_COMPUTE_32F_FAST_TF32,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+
+// ===========================================================================
 // FP8 GEMM (cuBLASLt):  y[M,N] = x[M,K] @ W_fp8[N,K]^T
 //
 // cuBLASLt 内部自动将 BF16 activation 量化为 FP8（per-tensor scale）
@@ -181,7 +222,9 @@ inline void fp8_preprocess_weight(
 //   y[m, n] *= w_scale[n]
 // matmul 已乘过 activation 的 per-tensor scale，此处只补权重列 scale。
 // ===========================================================================
-__global__ void fp8_apply_col_scale_kernel(
+// static：非模板 __global__，header 被多个 .cu 包含时给 TU-local 链接，
+// 否则分离编译下 nvlink 报 multiple definition。
+static __global__ void fp8_apply_col_scale_kernel(
     __nv_bfloat16* __restrict__ y,
     const float* __restrict__ w_scale,   // [N]
     const int M,
@@ -206,24 +249,61 @@ __global__ void fp8_apply_col_scale_kernel(
 // ===========================================================================
 
 // ===========================================================================
-// 激活量化: BF16 → FP8 E4M3 (per-tensor)
-// 返回 scale factor，调用者负责为 x_fp8 分配 M*K 空间
+// 激活量化: BF16 → FP8 E4M3 (per-tensor, 设备端动态 scale)
+//   两段 kernel：① 全局 amax 规约(block 归约 + atomicMax)；② 按 scale=amax/448 量化。
+//   amax≥0(取自 fabsf)，IEEE 非负浮点位序==数值序，故可用 uint atomicMax。
+//   static：非模板 __global__，多 TU 包含时给 TU-local 链接，避免 nvlink 重定义。
 // ===========================================================================
-inline float quantize_activation_fp8(
+static __global__ void fp8_amax_kernel(
+    const __nv_bfloat16* __restrict__ x, unsigned int* __restrict__ amax_bits, size_t n
+) {
+    __shared__ float s[256];
+    float local = 0.f;
+    for (size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         j < n; j += (size_t)gridDim.x * blockDim.x)
+        local = fmaxf(local, fabsf(__bfloat162float(x[j])));
+    const int t = threadIdx.x;
+    s[t] = local; __syncthreads();
+    for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+        if (t < off) s[t] = fmaxf(s[t], s[t + off]);
+        __syncthreads();
+    }
+    if (t == 0) atomicMax(amax_bits, __float_as_uint(s[0]));
+}
+
+static __global__ void fp8_quant_kernel(
+    const __nv_bfloat16* __restrict__ x, __nv_fp8_e4m3* __restrict__ out,
+    const unsigned int* __restrict__ amax_bits, float* __restrict__ scale_out, size_t n
+) {
+    float amax = __uint_as_float(*amax_bits);
+    float s = amax / 448.f;
+    if (s < 1e-10f) s = 1.f / 448.f;
+    const float inv = 1.f / s;
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0 && scale_out) *scale_out = s;
+    for (size_t j = i; j < n; j += (size_t)gridDim.x * blockDim.x) {
+        float q = __bfloat162float(x[j]) * inv;
+        q = fmaxf(-448.f, fminf(448.f, q));
+        out[j] = static_cast<__nv_fp8_e4m3>(q);
+    }
+}
+
+// host wrapper：x_scale(dev,1 float) 与 amax_scratch(dev,1 uint) 由调用方预分配。
+inline void quantize_activation_fp8(
     const __nv_bfloat16* x_bf16,
     __nv_fp8_e4m3* x_fp8,
-    const int M,
-    const int K,
+    float* x_scale,                 // device, 1 float (输出 per-tensor scale)
+    unsigned int* amax_scratch,     // device, 1 uint (规约临时)
+    size_t n,                       // 元素总数 (M*K)
     cudaStream_t stream = nullptr
 ) {
-    // TODO: 用 kernel 在 GPU 上求 max_abs + 量化，这里先给伪代码
-    // 实际需要 launch 一个 reduction kernel
-    //
-    // float amax = block_reduce_max(abs(x_bf16[i]))
-    // float a_scale = amax / 448.f
-    // x_fp8[i] = static_cast<__nv_fp8_e4m3>(__bfloat162float(x_bf16[i]) / a_scale)
-    (void)x_bf16; (void)x_fp8; (void)M; (void)K; (void)stream;
-    return 1.f / 448.f;  // placeholder
+    cudaMemsetAsync(amax_scratch, 0, sizeof(unsigned int), stream);
+    constexpr int threads = 256;
+    int blocks = (int)((n + threads - 1) / threads);
+    if (blocks > 1024) blocks = 1024;
+    if (blocks < 1) blocks = 1;
+    fp8_amax_kernel<<<blocks, threads, 0, stream>>>(x_bf16, amax_scratch, n);
+    fp8_quant_kernel<<<blocks, threads, 0, stream>>>(x_bf16, x_fp8, amax_scratch, x_scale, n);
 }
 
 // ===========================================================================

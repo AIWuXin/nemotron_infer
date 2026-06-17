@@ -40,6 +40,10 @@ namespace ref {
         }
     }
 
+    inline float silu_ref(float z) { return z / (1.f + std::exp(-z)); }
+
+    // 对齐 HF MambaRMSNormGated(norm_before_gate=False)：
+    //   gated = x*silu(gate); rstd = rsqrt(mean_group(gated^2)+eps); y = gated*rstd*w
     void rmsnorm_gated_fp32(
         const float *x, float *y, const float *w, const float *gate,
         size_t cols, size_t group_size, float eps
@@ -47,11 +51,13 @@ namespace ref {
         size_t groups = cols / group_size;
         for (size_t g = 0; g < groups; ++g) {
             float sum_sq = 0.f;
-            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-                sum_sq += x[i] * x[i];
+            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i) {
+                float gated = x[i] * silu_ref(gate[i]);
+                sum_sq += gated * gated;
+            }
             float scale = 1.f / std::sqrt(sum_sq / group_size + eps);
             for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-                y[i] = x[i] * scale * w[i] * gate[i];
+                y[i] = x[i] * silu_ref(gate[i]) * scale * w[i];
         }
     }
 
@@ -67,11 +73,14 @@ namespace ref {
         size_t groups = cols / group_size;
         for (size_t g = 0; g < groups; ++g) {
             float sum_sq = 0.f;
-            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i)
-                sum_sq += x_bf16[i] * x_bf16[i];
+            for (size_t i = g * group_size; i < (g + 1) * group_size; ++i) {
+                float gated = x_bf16[i] * silu_ref(gate_bf16[i]);
+                sum_sq += gated * gated;
+            }
             float scale = 1.f / std::sqrt(sum_sq / group_size + eps);
             for (size_t i = g * group_size; i < (g + 1) * group_size; ++i) {
-                float v = x_bf16[i] * scale * __bfloat162float(__float2bfloat16_rn(w[i])) * gate_bf16[i];
+                float gated = x_bf16[i] * silu_ref(gate_bf16[i]);
+                float v = gated * scale * __bfloat162float(__float2bfloat16_rn(w[i]));
                 y[i] = __bfloat162float(__float2bfloat16_rn(v));
             }
         }
