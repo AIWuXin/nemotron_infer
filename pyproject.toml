@@ -9,3 +9,9 @@ dependencies = [
     "pybind11>=3.0.4",
     "pybind11-stubgen<1",
 ]
+
+# 仅 dev：用于生成 HF 金标准 dump（tools/dump_mamba_block.py）。release 推理不需要。
+[dependency-groups]
+dev = [
+    "torch>=2.0",
+]
