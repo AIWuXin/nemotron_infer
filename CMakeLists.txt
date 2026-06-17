@@ -216,6 +216,14 @@ file(
         tests/ops/*.cu
 )
 
+# 模型/层级组装测试（MambaBlock / AttentionBlock / MLP / 整模型），
+# 与算子单测分开，避免 TEST_OPS 膨胀。
+file(
+        GLOB_RECURSE TEST_MODEL CONFIGURE_DEPENDS
+        tests/model/*.cpp
+        tests/model/*.cu
+)
+
 add_executable(
         TEST_TENSOR
         ${DIR_SOURCES}
@@ -305,6 +313,52 @@ if (TEST_OPS)
     )
     add_test(NAME TestOps COMMAND TEST_OPS)
     set_tests_properties(TestOps PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    )
+endif ()
+
+# ==========================================
+# 模型/层级组装测试目标 TEST_MODEL
+# ==========================================
+if (TEST_MODEL)
+    add_executable(
+            TEST_MODEL
+            ${DIR_SOURCES}
+            ${TEST_MODEL}
+            ${CUDNN_HOST_SOURCES}
+    )
+    target_include_directories(TEST_MODEL PRIVATE
+            ${CMAKE_SOURCE_DIR}/nemotron_infer/csrc/include          # tensor.h, allocator.cuh, model/*
+    )
+    target_link_libraries(
+            TEST_MODEL
+            Python3::Python        # 关键：链接 Python 库
+            pybind11::module       # 关键：链接 pybind11
+            CUDA::cudart
+            CUDA::cublas
+            glog::glog
+            GTest::gtest
+            GTest::gtest_main
+            GTest::gmock
+    )
+    if (USE_CUDNN)
+        target_link_libraries(TEST_MODEL ${CUDNN_LIBRARIES} cudnn_graph cudnn_frontend CUDA::nvrtc)
+        target_include_directories(TEST_MODEL PRIVATE ${CUDNN_INCLUDE_DIRS})
+
+        target_compile_definitions(TEST_MODEL PRIVATE USE_CUDNN)
+    endif ()
+    add_custom_command(TARGET TEST_MODEL POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:Python3::Python>        # 自动展开为 python312.dll 的完整路径
+            $<TARGET_FILE_DIR:TEST_MODEL>          # TEST_MODEL.exe 所在目录
+            COMMENT "Copying python312.dll next to TEST_MODEL.exe"
+    )
+    set_target_properties(
+            TEST_MODEL PROPERTIES
+            CUDA_SEPARABLE_COMPILATION ON
+    )
+    add_test(NAME TestModel COMMAND TEST_MODEL)
+    set_tests_properties(TestModel PROPERTIES
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     )
 endif ()
