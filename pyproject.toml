@@ -8,15 +8,30 @@ dependencies = [
     "numpy>=2.4.6",
     "pybind11>=3.0.4",
     "pybind11-stubgen<1",
+    "torch>=2.0",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+    "rich>=13.0"
 ]
 
 # dev：HF 金标准 dump + 整模型 Python 编排引擎（需 CUDA torch 提供 device 指针）。
 [dependency-groups]
 dev = [
-    "torch>=2.0",
-    "safetensors>=0.4",
-    "tokenizers>=0.20",
-    "rich>=13.0",
+    "invoke>=3.0.3",
+    "wheel>=0.47.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nemotron_infer*"]
+exclude = ["doc", "model", "third_party", "third_party*"]
+
+
+[tool.setuptools.package-data]
+nemotron_infer = [
+    "**/*.pyd", "**/*.dll",
+    "**/*.so", "**/*.dylib",
+    "**/include/**"
 ]
 
 # torch 从 PyTorch cu128 索引拉取（默认 PyPI 是 +cpu 轮子，GPU 编排不可用）。
